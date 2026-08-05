@@ -2,6 +2,7 @@ import os
 import re
 import zipfile
 import shutil
+import asyncio
 from pathlib import Path
 from flask import Flask, request
 from telegram import Update, Bot
@@ -25,7 +26,7 @@ except ImportError:
     RAR_SUPPORT = False
     print("⚠️ rarfile not found. RAR files will be skipped.")
 
-# ============= Core Functions =============
+# ============= Core Functions (unchanged) =============
 def extract_text_from_archive(archive_path):
     content = ""
     ext = os.path.splitext(archive_path)[1].lower()
@@ -166,7 +167,6 @@ async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     temp_dir = Path(context.user_data['temp_dir'])
     await update.message.reply_text(f"⏳ {len(files)} টি ফাইল প্রসেস করা হচ্ছে...")
     try:
-        import asyncio
         loop = asyncio.get_running_loop()
         count = await loop.run_in_executor(None, process_files, files, output_path)
         if count == 0:
@@ -224,23 +224,26 @@ def webhook():
         print(f"Webhook error: {e}")
         return "Error", 500
 
-# ============= Set Webhook =============
-def set_webhook():
-    """Render-এর URL দিয়ে ওয়েবহুক সেট করা"""
+# ============= Async Webhook Setter =============
+async def set_webhook():
+    """ওয়েবহুক সেট করা (async)"""
     app_url = os.getenv("RENDER_EXTERNAL_URL")
     if not app_url:
         print("⚠️ RENDER_EXTERNAL_URL not set. Webhook not configured.")
         return
     webhook_url = f"{app_url}/webhook"
     print(f"🔗 Setting webhook to: {webhook_url}")
-    bot.set_webhook(webhook_url)
+    await bot.set_webhook(webhook_url)
+    print("✅ Webhook set successfully!")
 
 # ============= Main =============
 if __name__ == "__main__":
-    # ওয়েবহুক সেট করুন
-    set_webhook()
+    # ১. ইভেন্ট লুপ তৈরি করে ওয়েবহুক সেট করি
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(set_webhook())
     
-    # Flask চালু করুন
+    # ২. Flask চালু করি
     port = int(os.environ.get("PORT", 5000))
     print(f"🚀 Flask server running on port {port}...")
     app.run(host="0.0.0.0", port=port)
