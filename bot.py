@@ -3,20 +3,22 @@ import re
 import zipfile
 import shutil
 import asyncio
+import threading
 from pathlib import Path
-from flask import Flask, request
-from telegram import Update, Bot
+from flask import Flask
+from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
 # ============= Flask App =============
-app = Flask(__name__)
+flask_app = Flask(__name__)
 
-# ============= Bot Token =============
-TOKEN = os.getenv("BOT_TOKEN")
-if not TOKEN:
-    raise ValueError("BOT_TOKEN environment variable not set!")
+@flask_app.route('/')
+def home():
+    return "Bot is running perfectly!"
 
-bot = Bot(token=TOKEN)
+@flask_app.route('/health')
+def health():
+    return "OK", 200
 
 # ============= RAR Support =============
 try:
@@ -24,9 +26,9 @@ try:
     RAR_SUPPORT = True
 except ImportError:
     RAR_SUPPORT = False
-    print("⚠️ rarfile not found. RAR files will be skipped.")
+    print("⚠️ rarfile module not found. RAR files will be skipped.")
 
-# ============= Core Functions (unchanged) =============
+# ============= Core Functions =============
 def extract_text_from_archive(archive_path):
     content = ""
     ext = os.path.splitext(archive_path)[1].lower()
@@ -40,14 +42,17 @@ def extract_text_from_archive(archive_path):
                     except Exception:
                         continue
     elif ext == '.rar' and RAR_SUPPORT:
-        with rarfile.RarFile(archive_path) as rf:
-            for info in rf.infolist():
-                if not info.is_dir() and info.filename.lower().endswith('.txt'):
-                    try:
-                        with rf.open(info) as f:
-                            content += f.read().decode('utf-8', errors='ignore') + "\n"
-                    except Exception:
-                        continue
+        try:
+            with rarfile.RarFile(archive_path) as rf:
+                for info in rf.infolist():
+                    if not info.is_dir() and info.filename.lower().endswith('.txt'):
+                        try:
+                            with rf.open(info) as f:
+                                content += f.read().decode('utf-8', errors='ignore') + "\n"
+                        except Exception:
+                            continue
+        except Exception as e:
+            print(f"Error reading RAR file: {e}")
     return content
 
 def clean_cc(cc):
@@ -119,7 +124,7 @@ def process_files(file_paths, output_path):
             f.write(card + '\n')
     return len(unique_cards)
 
-# ============= Telegram Handlers =============
+# ============= Telegram Bot Handlers =============
 AWAITING_FILES = 1
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -145,7 +150,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_name = document.file_name
     file_ext = os.path.splitext(file_name)[1].lower()
     if file_ext not in ['.txt', '.zip', '.rar']:
-        await update.message.reply_text(f"❌ শুধু .txt, .zip বা .rar গ্রহণযোগ্য।")
+        await update.message.reply_text("❌ শুধু .txt, .zip বা .rar গ্রহণযোগ্য।")
         return AWAITING_FILES
     try:
         file = await document.get_file()
@@ -192,58 +197,53 @@ async def cancel_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🚫 বাতিল করা হয়েছে।")
     return ConversationHandler.END
 
-# ============= Build Application =============
-application = Application.builder().token(TOKEN).build()
-conv_handler = ConversationHandler(
-    entry_points=[CommandHandler("merge", merge_start)],
-    states={
-        AWAITING_FILES: [
-            MessageHandler(filters.Document.ALL, handle_document),
-            CommandHandler("done", done_merge),
-            CommandHandler("cancel", cancel_merge),
-        ]
-    },
-    fallbacks=[CommandHandler("cancel", cancel_merge)],
-)
-application.add_handler(CommandHandler("start", start))
-application.add_handler(conv_handler)
+# ============= Bot Starter (Proper Async Lifecycle) =============
+def run_bot_async():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
-# ============= Webhook Endpoint =============
-@app.route('/', methods=['GET'])
-def home():
-    return "Bot is running!", 200
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    """টেলিগ্রাম থেকে ইনকামিং আপডেট গ্রহণ"""
-    try:
-        update = Update.de_json(request.get_json(force=True), bot)
-        application.process_update(update)
-        return "OK", 200
-    except Exception as e:
-        print(f"Webhook error: {e}")
-        return "Error", 500
-
-# ============= Async Webhook Setter =============
-async def set_webhook():
-    """ওয়েবহুক সেট করা (async)"""
-    app_url = os.getenv("RENDER_EXTERNAL_URL")
-    if not app_url:
-        print("⚠️ RENDER_EXTERNAL_URL not set. Webhook not configured.")
+    TOKEN = os.getenv("BOT_TOKEN")
+    if not TOKEN:
+        print("❌ BOT_TOKEN environment variable not set!")
         return
-    webhook_url = f"{app_url}/webhook"
-    print(f"🔗 Setting webhook to: {webhook_url}")
-    await bot.set_webhook(webhook_url)
-    print("✅ Webhook set successfully!")
+
+    app = Application.builder().token(TOKEN).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("merge", merge_start)],
+        states={
+            AWAITING_FILES: [
+                MessageHandler(filters.Document.ALL, handle_document),
+                CommandHandler("done", done_merge),
+                CommandHandler("cancel", cancel_merge),
+            ]
+        },
+        fallbacks=[CommandHandler("cancel", cancel_merge)],
+    )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(conv_handler)
+
+    async def main():
+        print("🤖 Initializing Bot...")
+        await app.initialize()
+        await app.start()
+        print("🤖 Starting Polling...")
+        await app.updater.start_polling(drop_pending_updates=True)
+        while True:
+            await asyncio.sleep(3600)
+
+    try:
+        loop.run_until_complete(main())
+    except Exception as e:
+        print(f"❌ Error running bot: {e}")
 
 # ============= Main =============
 if __name__ == "__main__":
-    # ১. ইভেন্ট লুপ তৈরি করে ওয়েবহুক সেট করি
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(set_webhook())
-    
-    # ২. Flask চালু করি
-    port = int(os.environ.get("PORT", 5000))
-    print(f"🚀 Flask server running on port {port}...")
-    app.run(host="0.0.0.0", port=port)
+    # Start Telegram Bot in background thread
+    bot_thread = threading.Thread(target=run_bot_async, daemon=True)
+    bot_thread.start()
+
+    # Start Flask Web Server in main thread for Render binding
+    port = int(os.environ.get("PORT", 10000))
+    print(f"🚀 Flask Web Server listening on port {port}...")
+    flask_app.run(host="0.0.0.0", port=port)
