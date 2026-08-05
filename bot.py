@@ -2,19 +2,20 @@ import os
 import re
 import zipfile
 import shutil
-import asyncio
-import threading
 from pathlib import Path
-from flask import Flask
-from telegram import Update
+from flask import Flask, request
+from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
 # ============= Flask App =============
-flask_app = Flask(__name__)
+app = Flask(__name__)
 
-@flask_app.route('/')
-def home():
-    return "Bot is running!"
+# ============= Bot Token =============
+TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("BOT_TOKEN environment variable not set!")
+
+bot = Bot(token=TOKEN)
 
 # ============= RAR Support =============
 try:
@@ -117,7 +118,7 @@ def process_files(file_paths, output_path):
             f.write(card + '\n')
     return len(unique_cards)
 
-# ============= Telegram Bot Handlers =============
+# ============= Telegram Handlers =============
 AWAITING_FILES = 1
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -165,6 +166,7 @@ async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     temp_dir = Path(context.user_data['temp_dir'])
     await update.message.reply_text(f"⏳ {len(files)} টি ফাইল প্রসেস করা হচ্ছে...")
     try:
+        import asyncio
         loop = asyncio.get_running_loop()
         count = await loop.run_in_executor(None, process_files, files, output_path)
         if count == 0:
@@ -190,56 +192,55 @@ async def cancel_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🚫 বাতিল করা হয়েছে।")
     return ConversationHandler.END
 
-# ============= Bot Starter (Signal-handler free) =============
-def start_bot():
-    """একটি নতুন ইভেন্ট লুপ তৈরি করে সিগন্যাল হ্যান্ডলার ছাড়া বট চালায়"""
-    # নতুন ইভেন্ট লুপ
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+# ============= Build Application =============
+application = Application.builder().token(TOKEN).build()
+conv_handler = ConversationHandler(
+    entry_points=[CommandHandler("merge", merge_start)],
+    states={
+        AWAITING_FILES: [
+            MessageHandler(filters.Document.ALL, handle_document),
+            CommandHandler("done", done_merge),
+            CommandHandler("cancel", cancel_merge),
+        ]
+    },
+    fallbacks=[CommandHandler("cancel", cancel_merge)],
+)
+application.add_handler(CommandHandler("start", start))
+application.add_handler(conv_handler)
 
-    TOKEN = os.getenv("BOT_TOKEN")
-    if not TOKEN:
-        print("❌ BOT_TOKEN environment variable not set!")
-        return
+# ============= Webhook Endpoint =============
+@app.route('/', methods=['GET'])
+def home():
+    return "Bot is running!", 200
 
-    # অ্যাপ্লিকেশন তৈরি
-    app = Application.builder().token(TOKEN).build()
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("merge", merge_start)],
-        states={
-            AWAITING_FILES: [
-                MessageHandler(filters.Document.ALL, handle_document),
-                CommandHandler("done", done_merge),
-                CommandHandler("cancel", cancel_merge),
-            ]
-        },
-        fallbacks=[CommandHandler("cancel", cancel_merge)],
-    )
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv_handler)
-
-    print("🤖 Bot starting with signal_handlers=False...")
-
-    # আপডেটার পোলিং শুরু করুন (সিগন্যাল হ্যান্ডলার বন্ধ)
-    # Note: Updater.start_polling() একটি করুটিন, তাই run_until_complete ব্যবহার করুন
-    loop.run_until_complete(app.updater.start_polling(signal_handlers=False))
-
-    # ইভেন্ট লুপ চালিয়ে রাখুন যতক্ষণ না প্রোগ্রাম বন্ধ হয়
-    print("🤖 Bot polling started. Press Ctrl+C to stop.")
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """টেলিগ্রাম থেকে ইনকামিং আপডেট গ্রহণ"""
     try:
-        loop.run_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        loop.run_until_complete(app.updater.stop())
+        update = Update.de_json(request.get_json(force=True), bot)
+        application.process_update(update)
+        return "OK", 200
+    except Exception as e:
+        print(f"Webhook error: {e}")
+        return "Error", 500
+
+# ============= Set Webhook =============
+def set_webhook():
+    """Render-এর URL দিয়ে ওয়েবহুক সেট করা"""
+    app_url = os.getenv("RENDER_EXTERNAL_URL")
+    if not app_url:
+        print("⚠️ RENDER_EXTERNAL_URL not set. Webhook not configured.")
+        return
+    webhook_url = f"{app_url}/webhook"
+    print(f"🔗 Setting webhook to: {webhook_url}")
+    bot.set_webhook(webhook_url)
 
 # ============= Main =============
 if __name__ == "__main__":
-    # ব্যাকগ্রাউন্ড থ্রেডে বট চালু করুন
-    bot_thread = threading.Thread(target=start_bot, daemon=True)
-    bot_thread.start()
-
-    # Flask অ্যাপ চালু করুন (মেইন থ্রেডে)
+    # ওয়েবহুক সেট করুন
+    set_webhook()
+    
+    # Flask চালু করুন
     port = int(os.environ.get("PORT", 5000))
-    print(f"🚀 Flask server starting on port {port}...")
-    flask_app.run(host="0.0.0.0", port=port)
+    print(f"🚀 Flask server running on port {port}...")
+    app.run(host="0.0.0.0", port=port)
