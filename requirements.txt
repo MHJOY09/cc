@@ -1,4 +1,2 @@
 Flask
 python-telegram-bot
-rarfilepython-telegram-bot
-rarfile
