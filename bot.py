@@ -9,10 +9,10 @@ from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
-# ============= Flask App for Render =============
-app = Flask(__name__)
+# ============= Flask App =============
+flask_app = Flask(__name__)
 
-@app.route('/')
+@flask_app.route('/')
 def home():
     return "Bot is running!"
 
@@ -24,7 +24,7 @@ except ImportError:
     RAR_SUPPORT = False
     print("⚠️ rarfile not found. RAR files will be skipped.")
 
-# ============= Core Functions (same as before) =============
+# ============= Core Functions (unchanged) =============
 def extract_text_from_archive(archive_path):
     content = ""
     ext = os.path.splitext(archive_path)[1].lower()
@@ -121,7 +121,7 @@ def process_files(file_paths, output_path):
 AWAITING_FILES = 1
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Welcome! Send /merge to start.")
+    await update.message.reply_text("👋 স্বাগতম! /merge দিয়ে শুরু করুন।")
 
 async def merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -131,19 +131,19 @@ async def merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['files'] = []
     context.user_data['output_file'] = str(temp_dir / "merged_output.txt")
     await update.message.reply_text(
-        "✅ Merge session started. Send your .txt/.zip/.rar files. Send /done when finished."
+        "✅ মার্জ সেশন শুরু হয়েছে। এখন আপনার টেক্সট/জিপ/রার ফাইলগুলো পাঠান। সব শেষে `/done` দিন।"
     )
     return AWAITING_FILES
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'files' not in context.user_data:
-        await update.message.reply_text("⚠️ Please send /merge first.")
+        await update.message.reply_text("⚠️ আগে `/merge` দিন।")
         return AWAITING_FILES
     document = update.message.document
     file_name = document.file_name
     file_ext = os.path.splitext(file_name)[1].lower()
     if file_ext not in ['.txt', '.zip', '.rar']:
-        await update.message.reply_text(f"❌ Only .txt, .zip or .rar allowed.")
+        await update.message.reply_text(f"❌ শুধু .txt, .zip বা .rar গ্রহণযোগ্য।")
         return AWAITING_FILES
     try:
         file = await document.get_file()
@@ -151,33 +151,33 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_path = temp_dir / file_name
         await file.download_to_drive(file_path)
         context.user_data['files'].append(str(file_path))
-        await update.message.reply_text(f"✅ '{file_name}' added (Total: {len(context.user_data['files'])}).")
+        await update.message.reply_text(f"✅ '{file_name}' জমা হয়েছে (মোট {len(context.user_data['files'])} টি)।")
     except Exception as e:
-        await update.message.reply_text(f"❌ Download error: {e}")
+        await update.message.reply_text(f"❌ ডাউনলোডে সমস্যা: {e}")
     return AWAITING_FILES
 
 async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'files' not in context.user_data or not context.user_data['files']:
-        await update.message.reply_text("⚠️ No files added.")
+        await update.message.reply_text("⚠️ কোনো ফাইল জমা নেই।")
         return ConversationHandler.END
     files = context.user_data['files']
     output_path = context.user_data['output_file']
     temp_dir = Path(context.user_data['temp_dir'])
-    await update.message.reply_text(f"⏳ Processing {len(files)} files...")
+    await update.message.reply_text(f"⏳ {len(files)} টি ফাইল প্রসেস করা হচ্ছে...")
     try:
         loop = asyncio.get_running_loop()
         count = await loop.run_in_executor(None, process_files, files, output_path)
         if count == 0:
-            await update.message.reply_text("😞 No valid data found.")
+            await update.message.reply_text("😞 কোনো বৈধ ডেটা পাওয়া যায়নি।")
         else:
             with open(output_path, 'rb') as f:
                 await update.message.reply_document(
                     document=f,
                     filename="merged_output.txt",
-                    caption=f"✅ Done! Found {count} unique lines."
+                    caption=f"✅ মার্জ সম্পন্ন! মোট {count} টি ইউনিক লাইন পাওয়া গেছে।"
                 )
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
+        await update.message.reply_text(f"❌ ত্রুটি: {e}")
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
         context.user_data.clear()
@@ -187,40 +187,35 @@ async def cancel_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'temp_dir' in context.user_data:
         shutil.rmtree(Path(context.user_data['temp_dir']), ignore_errors=True)
     context.user_data.clear()
-    await update.message.reply_text("🚫 Cancelled.")
+    await update.message.reply_text("🚫 বাতিল করা হয়েছে।")
     return ConversationHandler.END
 
-# ============= Run Bot in Background Thread =============
+# ============= Run Bot in Background =============
 def run_bot():
-    TOKEN = os.getenv("8831679155:AAGbH0769-ZRAVcK7SJrdMPXiIMYBEKNhRQ")  # Render environment variable
+    # টোকেন এনভায়রনমেন্ট থেকে নিন (নিরাপদ)
+    TOKEN = os.getenv("BOT_TOKEN")
     if not TOKEN:
-        print("❌ BOT_TOKEN not set!")
+        print("❌ BOT_TOKEN environment variable not set!")
         return
     
-    bot_app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).build()
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("merge", merge_start)],
-        states={
-            AWAITING_FILES: [
-                MessageHandler(filters.Document.ALL, handle_document),
-                CommandHandler("done", done_merge),
-                CommandHandler("cancel", cancel_merge),
-            ]
-        },
+        states={AWAITING_FILES: [MessageHandler(filters.Document.ALL, handle_document), CommandHandler("done", done_merge), CommandHandler("cancel", cancel_merge)]},
         fallbacks=[CommandHandler("cancel", cancel_merge)],
     )
-    bot_app.add_handler(CommandHandler("start", start))
-    bot_app.add_handler(conv_handler)
-    print("🤖 Bot started polling...")
-    bot_app.run_polling()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(conv_handler)
+    print("🤖 Bot polling started...")
+    app.run_polling()
 
 # ============= Main =============
 if __name__ == "__main__":
-    # Start bot in background thread
-    bot_thread = threading.Thread(target=run_bot)
-    bot_thread.daemon = True
+    # Bot thread চালু করুন
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
-    
-    # Run Flask app (for Render)
+    print("🤖 Bot thread started.")
+
+    # Flask চালু করুন (Render-এর জন্য)
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    flask_app.run(host="0.0.0.0", port=port)
