@@ -190,10 +190,10 @@ async def cancel_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🚫 বাতিল করা হয়েছে।")
     return ConversationHandler.END
 
-# ============= Bot Starter (with proper event loop) =============
+# ============= Bot Starter (Signal-handler free) =============
 def start_bot():
-    """একটি নতুন ইভেন্ট লুপ তৈরি করে বট চালায়"""
-    # নতুন ইভেন্ট লুপ তৈরি করুন
+    """একটি নতুন ইভেন্ট লুপ তৈরি করে সিগন্যাল হ্যান্ডলার ছাড়া বট চালায়"""
+    # নতুন ইভেন্ট লুপ
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -202,6 +202,7 @@ def start_bot():
         print("❌ BOT_TOKEN environment variable not set!")
         return
 
+    # অ্যাপ্লিকেশন তৈরি
     app = Application.builder().token(TOKEN).build()
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("merge", merge_start)],
@@ -217,9 +218,20 @@ def start_bot():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(conv_handler)
 
-    print("🤖 Bot polling started in background thread...")
-    # run_polling একটি করুটিন, তাই run_until_complete ব্যবহার করুন
-    loop.run_until_complete(app.run_polling())
+    print("🤖 Bot starting with signal_handlers=False...")
+
+    # আপডেটার পোলিং শুরু করুন (সিগন্যাল হ্যান্ডলার বন্ধ)
+    # Note: Updater.start_polling() একটি করুটিন, তাই run_until_complete ব্যবহার করুন
+    loop.run_until_complete(app.updater.start_polling(signal_handlers=False))
+
+    # ইভেন্ট লুপ চালিয়ে রাখুন যতক্ষণ না প্রোগ্রাম বন্ধ হয়
+    print("🤖 Bot polling started. Press Ctrl+C to stop.")
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        loop.run_until_complete(app.updater.stop())
 
 # ============= Main =============
 if __name__ == "__main__":
