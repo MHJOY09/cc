@@ -28,19 +28,22 @@ except ImportError:
     RAR_SUPPORT = False
     print("⚠️ rarfile module not found. RAR files will be skipped.")
 
-# ============= Core Functions =============
+# ============= Core Parsing & Processing Functions =============
 def extract_text_from_archive(archive_path):
     content = ""
     ext = os.path.splitext(archive_path)[1].lower()
     if ext == '.zip':
-        with zipfile.ZipFile(archive_path, 'r') as zf:
-            for info in zf.infolist():
-                if not info.is_dir() and info.filename.lower().endswith('.txt'):
-                    try:
-                        with zf.open(info) as f:
-                            content += f.read().decode('utf-8', errors='ignore') + "\n"
-                    except Exception:
-                        continue
+        try:
+            with zipfile.ZipFile(archive_path, 'r') as zf:
+                for info in zf.infolist():
+                    if not info.is_dir() and info.filename.lower().endswith('.txt'):
+                        try:
+                            with zf.open(info) as f:
+                                content += f.read().decode('utf-8', errors='ignore') + "\n"
+                        except Exception:
+                            continue
+        except Exception as e:
+            print(f"Zip extraction error: {e}")
     elif ext == '.rar' and RAR_SUPPORT:
         try:
             with rarfile.RarFile(archive_path) as rf:
@@ -52,46 +55,38 @@ def extract_text_from_archive(archive_path):
                         except Exception:
                             continue
         except Exception as e:
-            print(f"Error reading RAR file: {e}")
+            print(f"RAR extraction error: {e}")
     return content
 
-def clean_cc(cc):
-    return re.sub(r'[^0-9]', '', cc)
-
-def validate_parts(cc, mm, yy, cvv):
-    cc_clean = clean_cc(cc)
-    if not (13 <= len(cc_clean) <= 19):
-        return False
-    if not mm.isdigit() or not (1 <= int(mm) <= 12):
-        return False
-    if not yy.isdigit() or not (0 <= int(yy) <= 99):
-        if len(yy) == 4 and yy.isdigit():
-            pass
-        else:
-            return False
-    if not cvv.isdigit() or not (3 <= len(cvv) <= 4):
-        return False
-    return True
-
 def parse_line_to_cc_cvv(line):
-    line = line.strip()
-    if not line:
+    """
+    লাইন থেকে CC, MM, YY এবং CVV খুঁজে বের করার নমনীয় লজিক।
+    CVV থাকলে তা এক্সট্র্যাক্ট করবে, না থাকলে CC|MM|YY| ফরম্যাটে নিয়ে আসবে।
+    """
+    if not line or len(line) < 12:
         return None
-    parts = line.split('|')
-    if len(parts) == 4:
-        cc, mm, yy, cvv = parts
-        if cc.replace(' ', '').isdigit() and mm.isdigit() and yy.isdigit() and cvv.isdigit():
-            if validate_parts(cc, mm, yy, cvv):
-                return (clean_cc(cc), mm, yy, cvv)
-    digit_groups = re.findall(r'\d+', line)
-    if len(digit_groups) >= 4:
-        cc_candidate = digit_groups[0]
-        mm_candidate = digit_groups[1]
-        yy_candidate = digit_groups[2]
-        cvv_candidate = digit_groups[3]
-        if validate_parts(cc_candidate, mm_candidate, yy_candidate, cvv_candidate):
-            return (clean_cc(cc_candidate), mm_candidate, yy_candidate, cvv_candidate)
-    return None
+
+    # ১. ১৩ থেকে ১৯ ডিজিটের কার্ড নম্বর খোঁজা
+    cc_match = re.search(r'\b([3-6]\d{12,18})\b', line)
+    if not cc_match:
+        return None
+    cc = cc_match.group(1)
+
+    # ২. এক্সপায়ারি ডেট (MM/YY, MM/YYYY, MM|YY, MM-YY ইত্যাদি) খোঁজা
+    exp_match = re.search(r'\b(0[1-9]|1[0-2])[\s|/:\-,;]+(\d{4}|\d{2})\b', line)
+    if not exp_match:
+        return None
+        
+    mm = f"{int(exp_match.group(1)):02d}"
+    yy = exp_match.group(2)[-2:] # সবসময় শেষ ২ ডিজিট (যেমন: 2032 -> 32)
+
+    # ৩. CVV খোঁজা (কার্ড নম্বর ও এক্সপায়ারি ডেট বাদ দিয়ে বাকি অংশের ভেতর ৩ বা ৪ ডিজিট খোঁজা)
+    temp_line = line.replace(cc, '').replace(exp_match.group(0), '')
+    cvv_match = re.search(r'\b(\d{3,4})\b', temp_line)
+    
+    cvv = cvv_match.group(1) if cvv_match else ""
+
+    return (cc, mm, yy, cvv)
 
 def process_files(file_paths, output_path):
     unique_cards = set()
@@ -111,17 +106,17 @@ def process_files(file_paths, output_path):
             content = extract_text_from_archive(str(path))
         else:
             continue
+
         for line in content.splitlines():
             parsed = parse_line_to_cc_cvv(line)
             if parsed:
                 cc, mm, yy, cvv = parsed
-                if len(yy) == 4:
-                    yy = yy[-2:]
-                mm = f"{int(mm):02d}"
                 unique_cards.add(f"{cc}|{mm}|{yy}|{cvv}")
+
     with open(output_path, 'w', encoding='utf-8') as f:
         for card in sorted(unique_cards):
             f.write(card + '\n')
+
     return len(unique_cards)
 
 # ============= Telegram Bot Handlers =============
@@ -175,7 +170,7 @@ async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loop = asyncio.get_running_loop()
         count = await loop.run_in_executor(None, process_files, files, output_path)
         if count == 0:
-            await update.message.reply_text("😞 কোনো বৈধ ডেটা পাওয়া যায়নি।")
+            await update.message.reply_text("😞 কোনো বৈধ কার্ড ডেটা পাওয়া যায়নি।")
         else:
             with open(output_path, 'rb') as f:
                 await update.message.reply_document(
@@ -239,11 +234,9 @@ def run_bot_async():
 
 # ============= Main =============
 if __name__ == "__main__":
-    # Start Telegram Bot in background thread
     bot_thread = threading.Thread(target=run_bot_async, daemon=True)
     bot_thread.start()
 
-    # Start Flask Web Server in main thread for Render binding
     port = int(os.environ.get("PORT", 10000))
     print(f"🚀 Flask Web Server listening on port {port}...")
     flask_app.run(host="0.0.0.0", port=port)
