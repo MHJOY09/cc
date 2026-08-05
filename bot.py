@@ -14,7 +14,7 @@ flask_app = Flask(__name__)
 
 @flask_app.route('/')
 def home():
-    return "Bot is running perfectly!"
+    return "Cyber Engine Online!"
 
 @flask_app.route('/health')
 def health():
@@ -59,28 +59,24 @@ def extract_text_from_archive(archive_path):
     return content
 
 def parse_line_to_cc_cvv(line):
-    """
-    লাইন থেকে CC, MM, YY এবং CVV খুঁজে বের করার নমনীয় লজিক।
-    CVV থাকলে তা এক্সট্র্যাক্ট করবে, না থাকলে CC|MM|YY| ফরম্যাটে নিয়ে আসবে।
-    """
     if not line or len(line) < 12:
         return None
 
-    # ১. ১৩ থেকে ১৯ ডিজিটের কার্ড নম্বর খোঁজা
+    # ১৩ থেকে ১৯ ডিজিটের কার্ড নম্বর খোঁজা
     cc_match = re.search(r'\b([3-6]\d{12,18})\b', line)
     if not cc_match:
         return None
     cc = cc_match.group(1)
 
-    # ২. এক্সপায়ারি ডেট (MM/YY, MM/YYYY, MM|YY, MM-YY ইত্যাদি) খোঁজা
+    # এক্সপায়ারি ডেট খোঁজা
     exp_match = re.search(r'\b(0[1-9]|1[0-2])[\s|/:\-,;]+(\d{4}|\d{2})\b', line)
     if not exp_match:
         return None
         
     mm = f"{int(exp_match.group(1)):02d}"
-    yy = exp_match.group(2)[-2:] # সবসময় শেষ ২ ডিজিট (যেমন: 2032 -> 32)
+    yy = exp_match.group(2)[-2:]
 
-    # ৩. CVV খোঁজা (কার্ড নম্বর ও এক্সপায়ারি ডেট বাদ দিয়ে বাকি অংশের ভেতর ৩ বা ৪ ডিজিট খোঁজা)
+    # CVV খোঁজা (৩ বা ৪ ডিজিট)
     temp_line = line.replace(cc, '').replace(exp_match.group(0), '')
     cvv_match = re.search(r'\b(\d{3,4})\b', temp_line)
     
@@ -123,7 +119,14 @@ def process_files(file_paths, output_path):
 AWAITING_FILES = 1
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 স্বাগতম! /merge দিয়ে শুরু করুন।")
+    msg = (
+        "⚡ **CYBER SCANNER ENGINE v2.4** ⚡\n"
+        "────────────────────────\n"
+        "SYSTEM: `ONLINE` 🟢\n\n"
+        "👉 Start Session: /merge\n"
+        "👉 Abort Session: /cancel"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -132,67 +135,174 @@ async def merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['temp_dir'] = str(temp_dir)
     context.user_data['files'] = []
     context.user_data['output_file'] = str(temp_dir / "merged_output.txt")
-    await update.message.reply_text(
-        "✅ মার্জ সেশন শুরু হয়েছে। এখন আপনার টেক্সট/জিপ/রার ফাইলগুলো পাঠান। সব শেষে `/done` দিন।"
+    
+    # Live Status Dashboard
+    status_msg = await update.message.reply_text(
+        "🧠 **CYBER ENGINE INITIALIZED**\n"
+        "────────────────────────\n"
+        "📥 `STATUS`: Waiting for files...\n"
+        "📦 `TOTAL FILES`: `0`\n"
+        "📄 `LAST LOADED`: `None`\n"
+        "────────────────────────\n"
+        "⚡ Send `.txt`, `.zip`, or `.rar` files.\n"
+        "🚀 Send `/done` when finished.",
+        parse_mode="Markdown"
     )
+    context.user_data['status_msg_id'] = status_msg.message_id
     return AWAITING_FILES
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'files' not in context.user_data:
-        await update.message.reply_text("⚠️ আগে `/merge` দিন।")
+        await update.message.reply_text("⚠️ System inactive. Use `/merge` first.", parse_mode="Markdown")
         return AWAITING_FILES
+
+    # চ্যাট পরিষ্কার রাখতে ইউজারের পাঠানো ফাইল মেসেজ সাথে সাথেই ডিলিট করা
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
     document = update.message.document
     file_name = document.file_name
     file_ext = os.path.splitext(file_name)[1].lower()
+
     if file_ext not in ['.txt', '.zip', '.rar']:
-        await update.message.reply_text("❌ শুধু .txt, .zip বা .rar গ্রহণযোগ্য।")
         return AWAITING_FILES
+
     try:
         file = await document.get_file()
         temp_dir = Path(context.user_data['temp_dir'])
         file_path = temp_dir / file_name
         await file.download_to_drive(file_path)
         context.user_data['files'].append(str(file_path))
-        await update.message.reply_text(f"✅ '{file_name}' জমা হয়েছে (মোট {len(context.user_data['files'])} টি)।")
+        
+        # লাইভ ড্যাশবোর্ড টেক্সট আপডেট
+        count = len(context.user_data['files'])
+        status_msg_id = context.user_data.get('status_msg_id')
+        
+        updated_text = (
+            "⚙️ **ANALYZING & BUFFERING DATA**...\n"
+            "────────────────────────\n"
+            "📥 `STATUS`: Ingesting Logs...\n"
+            f"📦 `TOTAL FILES`: `{count}`\n"
+            f"📄 `LAST LOADED`: `{file_name}`\n"
+            "────────────────────────\n"
+            "⚡ Keep sending files or send `/done` to execute."
+        )
+        
+        if status_msg_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=update.effective_chat.id,
+                    message_id=status_msg_id,
+                    text=updated_text,
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+
     except Exception as e:
-        await update.message.reply_text(f"❌ ডাউনলোডে সমস্যা: {e}")
+        print(f"Download error: {e}")
+
     return AWAITING_FILES
 
 async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ইউজারের /done মেসেজটি ডিলিট করা
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
     if 'files' not in context.user_data or not context.user_data['files']:
-        await update.message.reply_text("⚠️ কোনো ফাইল জমা নেই।")
+        await update.message.reply_text("⚠️ No data loaded in buffer.", parse_mode="Markdown")
         return ConversationHandler.END
+
     files = context.user_data['files']
     output_path = context.user_data['output_file']
     temp_dir = Path(context.user_data['temp_dir'])
-    await update.message.reply_text(f"⏳ {len(files)} টি ফাইল প্রসেস করা হচ্ছে...")
+    status_msg_id = context.user_data.get('status_msg_id')
+
+    # ড্যাশবোর্ড এনালাইজিং স্টেটে নেওয়া
+    processing_text = (
+        "🔍 **CYBER PARSER EXECUTING**\n"
+        "────────────────────────\n"
+        "⚙️ `STAGE`: Extracting & Filtering Duplicates...\n"
+        f"📦 `FILES IN QUEUE`: `{len(files)}`\n"
+        "⏳ `STATUS`: Running RegEx Engine...\n"
+        "────────────────────────\n"
+        "⏳ Please wait..."
+    )
+    if status_msg_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=status_msg_id,
+                text=processing_text,
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
     try:
         loop = asyncio.get_running_loop()
         count = await loop.run_in_executor(None, process_files, files, output_path)
+
+        # ড্যাশবোর্ড মেসেজটি ডিলিট করে ক্লিন ফাইনাল রিপ্লাই দেওয়া
+        if status_msg_id:
+            try:
+                await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=status_msg_id)
+            except Exception:
+                pass
+
         if count == 0:
-            await update.message.reply_text("😞 কোনো বৈধ কার্ড ডেটা পাওয়া যায়নি।")
+            await update.message.reply_text("⚠️ **PARSE FAILED**: No valid target data found in buffer.", parse_mode="Markdown")
         else:
+            final_caption = (
+                "🎯 **EXTRACTION COMPLETE**\n"
+                "────────────────────────\n"
+                f"📊 `TOTAL UNIQUE CARDS`: `{count}`\n"
+                f"📁 `PROCESSED FILES`: `{len(files)}`\n"
+                "🛡️ `FORMAT`: `CC|MM|YY|CVV`\n"
+                "────────────────────────\n"
+                "🔥 Session Closed Successfully."
+            )
             with open(output_path, 'rb') as f:
-                await update.message.reply_document(
+                await context.bot.send_document(
+                    chat_id=update.effective_chat.id,
                     document=f,
-                    filename="merged_output.txt",
-                    caption=f"✅ মার্জ সম্পন্ন! মোট {count} টি ইউনিক লাইন পাওয়া গেছে।"
+                    filename="Merged_Cards_Output.txt",
+                    caption=final_caption,
+                    parse_mode="Markdown"
                 )
     except Exception as e:
-        await update.message.reply_text(f"❌ ত্রুটি: {e}")
+        await update.message.reply_text(f"❌ `SYSTEM ERROR`: {e}", parse_mode="Markdown")
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
         context.user_data.clear()
+
     return ConversationHandler.END
 
 async def cancel_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    status_msg_id = context.user_data.get('status_msg_id')
+    if status_msg_id:
+        try:
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=status_msg_id)
+        except Exception:
+            pass
+
     if 'temp_dir' in context.user_data:
         shutil.rmtree(Path(context.user_data['temp_dir']), ignore_errors=True)
+    
     context.user_data.clear()
-    await update.message.reply_text("🚫 বাতিল করা হয়েছে।")
+    await update.message.reply_text("🚫 **SESSION ABORTED & BUFFER PURGED**", parse_mode="Markdown")
     return ConversationHandler.END
 
-# ============= Bot Starter (Proper Async Lifecycle) =============
+# ============= Bot Starter =============
 def run_bot_async():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -219,7 +329,7 @@ def run_bot_async():
     app.add_handler(conv_handler)
 
     async def main():
-        print("🤖 Initializing Bot...")
+        print("🤖 Initializing Cyber Bot Engine...")
         await app.initialize()
         await app.start()
         print("🤖 Starting Polling...")
