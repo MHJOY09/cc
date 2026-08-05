@@ -24,7 +24,7 @@ except ImportError:
     RAR_SUPPORT = False
     print("⚠️ rarfile not found. RAR files will be skipped.")
 
-# ============= Core Functions (unchanged) =============
+# ============= Core Functions =============
 def extract_text_from_archive(archive_path):
     content = ""
     ext = os.path.splitext(archive_path)[1].lower()
@@ -190,32 +190,44 @@ async def cancel_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🚫 বাতিল করা হয়েছে।")
     return ConversationHandler.END
 
-# ============= Run Bot in Background =============
-def run_bot():
-    # টোকেন এনভায়রনমেন্ট থেকে নিন (নিরাপদ)
+# ============= Bot Starter (with proper event loop) =============
+def start_bot():
+    """একটি নতুন ইভেন্ট লুপ তৈরি করে বট চালায়"""
+    # নতুন ইভেন্ট লুপ তৈরি করুন
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     TOKEN = os.getenv("BOT_TOKEN")
     if not TOKEN:
         print("❌ BOT_TOKEN environment variable not set!")
         return
-    
+
     app = Application.builder().token(TOKEN).build()
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("merge", merge_start)],
-        states={AWAITING_FILES: [MessageHandler(filters.Document.ALL, handle_document), CommandHandler("done", done_merge), CommandHandler("cancel", cancel_merge)]},
+        states={
+            AWAITING_FILES: [
+                MessageHandler(filters.Document.ALL, handle_document),
+                CommandHandler("done", done_merge),
+                CommandHandler("cancel", cancel_merge),
+            ]
+        },
         fallbacks=[CommandHandler("cancel", cancel_merge)],
     )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(conv_handler)
-    print("🤖 Bot polling started...")
-    app.run_polling()
+
+    print("🤖 Bot polling started in background thread...")
+    # run_polling একটি করুটিন, তাই run_until_complete ব্যবহার করুন
+    loop.run_until_complete(app.run_polling())
 
 # ============= Main =============
 if __name__ == "__main__":
-    # Bot thread চালু করুন
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    # ব্যাকগ্রাউন্ড থ্রেডে বট চালু করুন
+    bot_thread = threading.Thread(target=start_bot, daemon=True)
     bot_thread.start()
-    print("🤖 Bot thread started.")
 
-    # Flask চালু করুন (Render-এর জন্য)
+    # Flask অ্যাপ চালু করুন (মেইন থ্রেডে)
     port = int(os.environ.get("PORT", 5000))
+    print(f"🚀 Flask server starting on port {port}...")
     flask_app.run(host="0.0.0.0", port=port)
