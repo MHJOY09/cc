@@ -59,16 +59,20 @@ def extract_text_from_archive(archive_path):
     return content
 
 def parse_line_to_cc_cvv(line):
+    """
+    একক লাইনের লগ থেকে CC, MM, YY এবং CVV বের করে।
+    CVV না পাওয়া গেলে সরাসরি None রিটার্ন করবে (Skip করবে)।
+    """
     if not line or len(line) < 12:
         return None
 
-    # ১৩ থেকে ১৯ ডিজিটের কার্ড নম্বর খোঁজা
+    # ১. ১৩ থেকে ১৯ ডিজিটের কার্ড নম্বর খোঁজা
     cc_match = re.search(r'\b([3-6]\d{12,18})\b', line)
     if not cc_match:
         return None
     cc = cc_match.group(1)
 
-    # এক্সপায়ারি ডেট খোঁজা
+    # ২. এক্সপায়ারি ডেট (MM/YY, MM/YYYY, MM|YY ইত্যাদি) খোঁজা
     exp_match = re.search(r'\b(0[1-9]|1[0-2])[\s|/:\-,;]+(\d{4}|\d{2})\b', line)
     if not exp_match:
         return None
@@ -76,16 +80,48 @@ def parse_line_to_cc_cvv(line):
     mm = f"{int(exp_match.group(1)):02d}"
     yy = exp_match.group(2)[-2:]
 
-    # CVV খোঁজা (৩ বা ৪ ডিজিট)
+    # ৩. CVV খোঁজা (কার্ড নম্বর ও ডেট বাদ দিয়ে বাকি অংশে ৩ বা ৪ ডিজিট)
     temp_line = line.replace(cc, '').replace(exp_match.group(0), '')
     cvv_match = re.search(r'\b(\d{3,4})\b', temp_line)
     
-    cvv = cvv_match.group(1) if cvv_match else ""
+    # ❌ CVV না থাকলে এই লাইনটি বাদ (Skip) দেওয়া হবে
+    if not cvv_match:
+        return None
+        
+    cvv = cvv_match.group(1)
 
     return (cc, mm, yy, cvv)
 
-def process_files(file_paths, output_path):
+def extract_cards_from_text(content):
     unique_cards = set()
+
+    # ১. সিঙ্গেল-লাইন ফরম্যাট ফিল্টারিং
+    for line in content.splitlines():
+        parsed = parse_line_to_cc_cvv(line)
+        if parsed:
+            cc, mm, yy, cvv = parsed
+            unique_cards.add(f"{cc}|{mm}|{yy}|{cvv}")
+
+    # ২. মাল্টি-লাইন বা ব্লক ফরম্যাট ফিল্টারিং (যেমন: CN: ... \n DATE: ... \n CVV: ...)
+    block_pattern = re.compile(
+        r'(?:CN|CARD|CC)?[:\s]*([3-6]\d{12,18})[\s\S]*?'
+        r'(?:DATE|EXP)?[:\s]*(0[1-9]|1[0-2])[\s/|\-,;]+(\d{4}|\d{2})[\s\S]*?'
+        r'(?:CVV|CVC)[:\s]*(\d{3,4})',
+        re.IGNORECASE
+    )
+    
+    for match in block_pattern.finditer(content):
+        cc = match.group(1)
+        mm = f"{int(match.group(2)):02d}"
+        yy = match.group(3)[-2:]
+        cvv = match.group(4)
+        if cvv: # নিশ্চিত করা হচ্ছে CVV যেন খালি না থাকে
+            unique_cards.add(f"{cc}|{mm}|{yy}|{cvv}")
+
+    return unique_cards
+
+def process_files(file_paths, output_path):
+    all_unique_cards = set()
     for path in file_paths:
         path = Path(path)
         if not path.exists():
@@ -103,26 +139,24 @@ def process_files(file_paths, output_path):
         else:
             continue
 
-        for line in content.splitlines():
-            parsed = parse_line_to_cc_cvv(line)
-            if parsed:
-                cc, mm, yy, cvv = parsed
-                unique_cards.add(f"{cc}|{mm}|{yy}|{cvv}")
+        extracted = extract_cards_from_text(content)
+        all_unique_cards.update(extracted)
 
     with open(output_path, 'w', encoding='utf-8') as f:
-        for card in sorted(unique_cards):
+        for card in sorted(all_unique_cards):
             f.write(card + '\n')
 
-    return len(unique_cards)
+    return len(all_unique_cards)
 
 # ============= Telegram Bot Handlers =============
 AWAITING_FILES = 1
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "⚡ **CYBER SCANNER ENGINE v2.4** ⚡\n"
+        "⚡ **CYBER SCANNER ENGINE v3.0** ⚡\n"
         "────────────────────────\n"
-        "SYSTEM: `ONLINE` 🟢\n\n"
+        "SYSTEM: `ONLINE` 🟢\n"
+        "FILTER: `ONLY VALID CVV CARDS` 🛡️\n\n"
         "👉 Start Session: /merge\n"
         "👉 Abort Session: /cancel"
     )
@@ -136,7 +170,7 @@ async def merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['files'] = []
     context.user_data['output_file'] = str(temp_dir / "merged_output.txt")
     
-    # Live Status Dashboard
+    # Dashboard Status Message
     status_msg = await update.message.reply_text(
         "🧠 **CYBER ENGINE INITIALIZED**\n"
         "────────────────────────\n"
@@ -156,7 +190,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ System inactive. Use `/merge` first.", parse_mode="Markdown")
         return AWAITING_FILES
 
-    # চ্যাট পরিষ্কার রাখতে ইউজারের পাঠানো ফাইল মেসেজ সাথে সাথেই ডিলিট করা
+    # মেসেজ ক্লিন রাখার জন্য ইউজারের মেসেজ ডিলিট
     try:
         await update.message.delete()
     except Exception:
@@ -176,7 +210,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await file.download_to_drive(file_path)
         context.user_data['files'].append(str(file_path))
         
-        # লাইভ ড্যাশবোর্ড টেক্সট আপডেট
+        # লাইভ ড্যাশবোর্ড আপডেট
         count = len(context.user_data['files'])
         status_msg_id = context.user_data.get('status_msg_id')
         
@@ -207,7 +241,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return AWAITING_FILES
 
 async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ইউজারের /done মেসেজটি ডিলিট করা
     try:
         await update.message.delete()
     except Exception:
@@ -222,11 +255,10 @@ async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     temp_dir = Path(context.user_data['temp_dir'])
     status_msg_id = context.user_data.get('status_msg_id')
 
-    # ড্যাশবোর্ড এনালাইজিং স্টেটে নেওয়া
     processing_text = (
         "🔍 **CYBER PARSER EXECUTING**\n"
         "────────────────────────\n"
-        "⚙️ `STAGE`: Extracting & Filtering Duplicates...\n"
+        "⚙️ `STAGE`: Filtering No-CVV & Duplicates...\n"
         f"📦 `FILES IN QUEUE`: `{len(files)}`\n"
         "⏳ `STATUS`: Running RegEx Engine...\n"
         "────────────────────────\n"
@@ -247,7 +279,6 @@ async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loop = asyncio.get_running_loop()
         count = await loop.run_in_executor(None, process_files, files, output_path)
 
-        # ড্যাশবোর্ড মেসেজটি ডিলিট করে ক্লিন ফাইনাল রিপ্লাই দেওয়া
         if status_msg_id:
             try:
                 await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=status_msg_id)
@@ -255,12 +286,12 @@ async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
         if count == 0:
-            await update.message.reply_text("⚠️ **PARSE FAILED**: No valid target data found in buffer.", parse_mode="Markdown")
+            await update.message.reply_text("⚠️ **PARSE FAILED**: No valid cards with CVV found.", parse_mode="Markdown")
         else:
             final_caption = (
                 "🎯 **EXTRACTION COMPLETE**\n"
                 "────────────────────────\n"
-                f"📊 `TOTAL UNIQUE CARDS`: `{count}`\n"
+                f"📊 `TOTAL CARDS (WITH CVV)`: `{count}`\n"
                 f"📁 `PROCESSED FILES`: `{len(files)}`\n"
                 "🛡️ `FORMAT`: `CC|MM|YY|CVV`\n"
                 "────────────────────────\n"
@@ -270,7 +301,7 @@ async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_document(
                     chat_id=update.effective_chat.id,
                     document=f,
-                    filename="Merged_Cards_Output.txt",
+                    filename="Merged_Cards_With_CVV.txt",
                     caption=final_caption,
                     parse_mode="Markdown"
                 )
