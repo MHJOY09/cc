@@ -4,12 +4,22 @@ import zipfile
 import shutil
 import asyncio
 import threading
+import time
+import requests
 from pathlib import Path
 from flask import Flask
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    ConversationHandler,
+)
+from telegram.error import TelegramError, Forbidden, BadRequest
 
-# ============= Flask App =============
+# ============= Flask Web Server =============
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -20,15 +30,29 @@ def home():
 def health():
     return "OK", 200
 
-# ============= RAR Support =============
+# ============= Self-Ping System (Prevents Render Sleep) =============
+def self_ping_loop():
+    """Render-এর ১৫ মিনিটের ইনঅ্যাক্টিভিটি স্লিপ মোড প্রতিরোধে অটো-পিং লুপ"""
+    time.sleep(10)  # সার্ভার সম্পূর্ণ চালু হওয়ার জন্য ১০ সেকেন্ড ওয়েট
+    port = os.environ.get("PORT", "10000")
+    # স্থানীয়ভাবে অথবা Render প্রক্সি ইন্টারফেসে পিং পাঠানো
+    url = f"http://127.0.0.1:{port}/health"
+    
+    while True:
+        try:
+            requests.get(url, timeout=10)
+        except Exception:
+            pass
+        time.sleep(600)  # প্রতি ১০ মিনিট পর পর পিং করবে
+
+# ============= RAR File Support =============
 try:
     import rarfile
     RAR_SUPPORT = True
 except ImportError:
     RAR_SUPPORT = False
-    print("⚠️ rarfile module not found. RAR files will be skipped.")
 
-# ============= Core Parsing & Processing Functions =============
+# ============= Core Processing Logics =============
 def extract_text_from_archive(archive_path):
     content = ""
     ext = os.path.splitext(archive_path)[1].lower()
@@ -42,8 +66,8 @@ def extract_text_from_archive(archive_path):
                                 content += f.read().decode('utf-8', errors='ignore') + "\n"
                         except Exception:
                             continue
-        except Exception as e:
-            print(f"Zip extraction error: {e}")
+        except Exception:
+            pass
     elif ext == '.rar' and RAR_SUPPORT:
         try:
             with rarfile.RarFile(archive_path) as rf:
@@ -54,25 +78,22 @@ def extract_text_from_archive(archive_path):
                                 content += f.read().decode('utf-8', errors='ignore') + "\n"
                         except Exception:
                             continue
-        except Exception as e:
-            print(f"RAR extraction error: {e}")
+        except Exception:
+            pass
     return content
 
 def parse_line_to_cc_cvv(line):
-    """
-    একক লাইনের লগ থেকে CC, MM, YY এবং CVV বের করে।
-    CVV না পাওয়া গেলে সরাসরি None রিটার্ন করবে (Skip করবে)।
-    """
+    """একক লাইনের লগ থেকে ভ্যালিড CVV সহ CC এক্সট্র্যাক্ট করে"""
     if not line or len(line) < 12:
         return None
 
-    # ১. ১৩ থেকে ১৯ ডিজিটের কার্ড নম্বর খোঁজা
+    # ১৩ থেকে ১৯ ডিজিটের কার্ড নম্বর
     cc_match = re.search(r'\b([3-6]\d{12,18})\b', line)
     if not cc_match:
         return None
     cc = cc_match.group(1)
 
-    # ২. এক্সপায়ারি ডেট (MM/YY, MM/YYYY, MM|YY ইত্যাদি) খোঁজা
+    # এক্সপায়ারি ডেট (MM/YY বা MM/YYYY)
     exp_match = re.search(r'\b(0[1-9]|1[0-2])[\s|/:\-,;]+(\d{4}|\d{2})\b', line)
     if not exp_match:
         return None
@@ -80,29 +101,28 @@ def parse_line_to_cc_cvv(line):
     mm = f"{int(exp_match.group(1)):02d}"
     yy = exp_match.group(2)[-2:]
 
-    # ৩. CVV খোঁজা (কার্ড নম্বর ও ডেট বাদ দিয়ে বাকি অংশে ৩ বা ৪ ডিজিট)
+    # CVV (কার্ড নম্বর ও ডেট বাদ দিয়ে ৩ বা ৪ ডিজিট)
     temp_line = line.replace(cc, '').replace(exp_match.group(0), '')
     cvv_match = re.search(r'\b(\d{3,4})\b', temp_line)
     
-    # ❌ CVV না থাকলে এই লাইনটি বাদ (Skip) দেওয়া হবে
+    # ❌ CVV না থাকলে বাদ (Skip)
     if not cvv_match:
         return None
         
     cvv = cvv_match.group(1)
-
     return (cc, mm, yy, cvv)
 
 def extract_cards_from_text(content):
     unique_cards = set()
 
-    # ১. সিঙ্গেল-লাইন ফরম্যাট ফিল্টারিং
+    # ১. সিঙ্গেল-লাইন ফরম্যাট প্রসেসিং
     for line in content.splitlines():
         parsed = parse_line_to_cc_cvv(line)
         if parsed:
             cc, mm, yy, cvv = parsed
             unique_cards.add(f"{cc}|{mm}|{yy}|{cvv}")
 
-    # ২. মাল্টি-লাইন বা ব্লক ফরম্যাট ফিল্টারিং (যেমন: CN: ... \n DATE: ... \n CVV: ...)
+    # ২. মাল্টি-লাইন বা ব্লক ফরম্যাট প্রসেসিং (CN: ... \n DATE: ... \n CVV: ...)
     block_pattern = re.compile(
         r'(?:CN|CARD|CC)?[:\s]*([3-6]\d{12,18})[\s\S]*?'
         r'(?:DATE|EXP)?[:\s]*(0[1-9]|1[0-2])[\s/|\-,;]+(\d{4}|\d{2})[\s\S]*?'
@@ -115,7 +135,7 @@ def extract_cards_from_text(content):
         mm = f"{int(match.group(2)):02d}"
         yy = match.group(3)[-2:]
         cvv = match.group(4)
-        if cvv: # নিশ্চিত করা হচ্ছে CVV যেন খালি না থাকে
+        if cvv:
             unique_cards.add(f"{cc}|{mm}|{yy}|{cvv}")
 
     return unique_cards
@@ -151,16 +171,26 @@ def process_files(file_paths, output_path):
 # ============= Telegram Bot Handlers =============
 AWAITING_FILES = 1
 
+async def safe_delete_message(message):
+    """যেকোনো মেসেজ নিরাপদে ডিলিট করার ফাংশন (ক্র্যাশ প্রুফ)"""
+    try:
+        await message.delete()
+    except (Forbidden, BadRequest, TelegramError):
+        pass
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "⚡ **CYBER SCANNER ENGINE v3.0** ⚡\n"
+        "⚡ **CYBER SCANNER ENGINE v3.1** ⚡\n"
         "────────────────────────\n"
         "SYSTEM: `ONLINE` 🟢\n"
         "FILTER: `ONLY VALID CVV CARDS` 🛡️\n\n"
         "👉 Start Session: /merge\n"
         "👉 Abort Session: /cancel"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    try:
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except (Forbidden, TelegramError):
+        pass
 
 async def merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -170,31 +200,33 @@ async def merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['files'] = []
     context.user_data['output_file'] = str(temp_dir / "merged_output.txt")
     
-    # Dashboard Status Message
-    status_msg = await update.message.reply_text(
-        "🧠 **CYBER ENGINE INITIALIZED**\n"
-        "────────────────────────\n"
-        "📥 `STATUS`: Waiting for files...\n"
-        "📦 `TOTAL FILES`: `0`\n"
-        "📄 `LAST LOADED`: `None`\n"
-        "────────────────────────\n"
-        "⚡ Send `.txt`, `.zip`, or `.rar` files.\n"
-        "🚀 Send `/done` when finished.",
-        parse_mode="Markdown"
-    )
-    context.user_data['status_msg_id'] = status_msg.message_id
+    try:
+        status_msg = await update.message.reply_text(
+            "🧠 **CYBER ENGINE INITIALIZED**\n"
+            "────────────────────────\n"
+            "📥 `STATUS`: Waiting for files...\n"
+            "📦 `TOTAL FILES`: `0`\n"
+            "📄 `LAST LOADED`: `None`\n"
+            "────────────────────────\n"
+            "⚡ Send `.txt`, `.zip`, or `.rar` files.\n"
+            "🚀 Send `/done` when finished.",
+            parse_mode="Markdown"
+        )
+        context.user_data['status_msg_id'] = status_msg.message_id
+    except (Forbidden, TelegramError):
+        pass
+
     return AWAITING_FILES
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'files' not in context.user_data:
-        await update.message.reply_text("⚠️ System inactive. Use `/merge` first.", parse_mode="Markdown")
+        try:
+            await update.message.reply_text("⚠️ System inactive. Use `/merge` first.", parse_mode="Markdown")
+        except (Forbidden, TelegramError):
+            pass
         return AWAITING_FILES
 
-    # মেসেজ ক্লিন রাখার জন্য ইউজারের মেসেজ ডিলিট
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
+    await safe_delete_message(update.message)
 
     document = update.message.document
     file_name = document.file_name
@@ -210,7 +242,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await file.download_to_drive(file_path)
         context.user_data['files'].append(str(file_path))
         
-        # লাইভ ড্যাশবোর্ড আপডেট
         count = len(context.user_data['files'])
         status_msg_id = context.user_data.get('status_msg_id')
         
@@ -232,7 +263,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text=updated_text,
                     parse_mode="Markdown"
                 )
-            except Exception:
+            except (Forbidden, BadRequest, TelegramError):
                 pass
 
     except Exception as e:
@@ -241,13 +272,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return AWAITING_FILES
 
 async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
+    await safe_delete_message(update.message)
 
     if 'files' not in context.user_data or not context.user_data['files']:
-        await update.message.reply_text("⚠️ No data loaded in buffer.", parse_mode="Markdown")
+        try:
+            await update.message.reply_text("⚠️ No data loaded in buffer.", parse_mode="Markdown")
+        except (Forbidden, TelegramError):
+            pass
         return ConversationHandler.END
 
     files = context.user_data['files']
@@ -272,7 +303,7 @@ async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=processing_text,
                 parse_mode="Markdown"
             )
-        except Exception:
+        except (Forbidden, BadRequest, TelegramError):
             pass
 
     try:
@@ -282,7 +313,7 @@ async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if status_msg_id:
             try:
                 await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=status_msg_id)
-            except Exception:
+            except (Forbidden, BadRequest, TelegramError):
                 pass
 
         if count == 0:
@@ -305,8 +336,13 @@ async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     caption=final_caption,
                     parse_mode="Markdown"
                 )
+    except (Forbidden, TelegramError) as e:
+        print(f"Telegram communication blocked/failed: {e}")
     except Exception as e:
-        await update.message.reply_text(f"❌ `SYSTEM ERROR`: {e}", parse_mode="Markdown")
+        try:
+            await update.message.reply_text(f"❌ `SYSTEM ERROR`: {e}", parse_mode="Markdown")
+        except (Forbidden, TelegramError):
+            pass
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
         context.user_data.clear()
@@ -314,33 +350,34 @@ async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def cancel_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
+    await safe_delete_message(update.message)
 
     status_msg_id = context.user_data.get('status_msg_id')
     if status_msg_id:
         try:
             await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=status_msg_id)
-        except Exception:
+        except (Forbidden, BadRequest, TelegramError):
             pass
 
     if 'temp_dir' in context.user_data:
         shutil.rmtree(Path(context.user_data['temp_dir']), ignore_errors=True)
     
     context.user_data.clear()
-    await update.message.reply_text("🚫 **SESSION ABORTED & BUFFER PURGED**", parse_mode="Markdown")
+    try:
+        await update.message.reply_text("🚫 **SESSION ABORTED & BUFFER PURGED**", parse_mode="Markdown")
+    except (Forbidden, TelegramError):
+        pass
+
     return ConversationHandler.END
 
-# ============= Bot Starter =============
+# ============= Async Bot Launcher =============
 def run_bot_async():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     TOKEN = os.getenv("BOT_TOKEN")
     if not TOKEN:
-        print("❌ BOT_TOKEN environment variable not set!")
+        print("❌ BOT_TOKEN environment variable missing!")
         return
 
     app = Application.builder().token(TOKEN).build()
@@ -363,7 +400,7 @@ def run_bot_async():
         print("🤖 Initializing Cyber Bot Engine...")
         await app.initialize()
         await app.start()
-        print("🤖 Starting Polling...")
+        print("🤖 Polling Loop Active...")
         await app.updater.start_polling(drop_pending_updates=True)
         while True:
             await asyncio.sleep(3600)
@@ -371,13 +408,19 @@ def run_bot_async():
     try:
         loop.run_until_complete(main())
     except Exception as e:
-        print(f"❌ Error running bot: {e}")
+        print(f"❌ Core Error: {e}")
 
-# ============= Main =============
+# ============= Application Main =============
 if __name__ == "__main__":
+    # ১. টেলিগ্রাম বটের থ্রেড চালু করা
     bot_thread = threading.Thread(target=run_bot_async, daemon=True)
     bot_thread.start()
 
+    # ২. Self-Ping থ্রেড চালু করা (স্লিপ মোড বন্ধ রাখতে)
+    ping_thread = threading.Thread(target=self_ping_loop, daemon=True)
+    ping_thread.start()
+
+    # ৩. Flask ওয়েব সার্ভার চালু করা
     port = int(os.environ.get("PORT", 10000))
-    print(f"🚀 Flask Web Server listening on port {port}...")
+    print(f"🚀 Web Server Active on Port {port}...")
     flask_app.run(host="0.0.0.0", port=port)
