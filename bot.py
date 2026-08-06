@@ -5,7 +5,7 @@ import shutil
 import asyncio
 import threading
 import time
-import requests
+import urllib.request  # Built-in module (requests এর দরকার নেই)
 from pathlib import Path
 from flask import Flask
 from telegram import Update
@@ -30,20 +30,20 @@ def home():
 def health():
     return "OK", 200
 
-# ============= Self-Ping System (Prevents Render Sleep) =============
+# ============= Self-Ping System (Built-in urllib) =============
 def self_ping_loop():
-    """Render-এর ১৫ মিনিটের ইনঅ্যাক্টিভিটি স্লিপ মোড প্রতিরোধে অটো-পিং লুপ"""
-    time.sleep(10)  # সার্ভার সম্পূর্ণ চালু হওয়ার জন্য ১০ সেকেন্ড ওয়েট
+    time.sleep(10)
     port = os.environ.get("PORT", "10000")
-    # স্থানীয়ভাবে অথবা Render প্রক্সি ইন্টারফেসে পিং পাঠানো
     url = f"http://127.0.0.1:{port}/health"
     
     while True:
         try:
-            requests.get(url, timeout=10)
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                pass
         except Exception:
             pass
-        time.sleep(600)  # প্রতি ১০ মিনিট পর পর পিং করবে
+        time.sleep(600)  # প্রতি ১০ মিনিটে পিং
 
 # ============= RAR File Support =============
 try:
@@ -83,17 +83,14 @@ def extract_text_from_archive(archive_path):
     return content
 
 def parse_line_to_cc_cvv(line):
-    """একক লাইনের লগ থেকে ভ্যালিড CVV সহ CC এক্সট্র্যাক্ট করে"""
     if not line or len(line) < 12:
         return None
 
-    # ১৩ থেকে ১৯ ডিজিটের কার্ড নম্বর
     cc_match = re.search(r'\b([3-6]\d{12,18})\b', line)
     if not cc_match:
         return None
     cc = cc_match.group(1)
 
-    # এক্সপায়ারি ডেট (MM/YY বা MM/YYYY)
     exp_match = re.search(r'\b(0[1-9]|1[0-2])[\s|/:\-,;]+(\d{4}|\d{2})\b', line)
     if not exp_match:
         return None
@@ -101,11 +98,9 @@ def parse_line_to_cc_cvv(line):
     mm = f"{int(exp_match.group(1)):02d}"
     yy = exp_match.group(2)[-2:]
 
-    # CVV (কার্ড নম্বর ও ডেট বাদ দিয়ে ৩ বা ৪ ডিজিট)
     temp_line = line.replace(cc, '').replace(exp_match.group(0), '')
     cvv_match = re.search(r'\b(\d{3,4})\b', temp_line)
     
-    # ❌ CVV না থাকলে বাদ (Skip)
     if not cvv_match:
         return None
         
@@ -115,14 +110,12 @@ def parse_line_to_cc_cvv(line):
 def extract_cards_from_text(content):
     unique_cards = set()
 
-    # ১. সিঙ্গেল-লাইন ফরম্যাট প্রসেসিং
     for line in content.splitlines():
         parsed = parse_line_to_cc_cvv(line)
         if parsed:
             cc, mm, yy, cvv = parsed
             unique_cards.add(f"{cc}|{mm}|{yy}|{cvv}")
 
-    # ২. মাল্টি-লাইন বা ব্লক ফরম্যাট প্রসেসিং (CN: ... \n DATE: ... \n CVV: ...)
     block_pattern = re.compile(
         r'(?:CN|CARD|CC)?[:\s]*([3-6]\d{12,18})[\s\S]*?'
         r'(?:DATE|EXP)?[:\s]*(0[1-9]|1[0-2])[\s/|\-,;]+(\d{4}|\d{2})[\s\S]*?'
@@ -172,7 +165,6 @@ def process_files(file_paths, output_path):
 AWAITING_FILES = 1
 
 async def safe_delete_message(message):
-    """যেকোনো মেসেজ নিরাপদে ডিলিট করার ফাংশন (ক্র্যাশ প্রুফ)"""
     try:
         await message.delete()
     except (Forbidden, BadRequest, TelegramError):
@@ -337,7 +329,7 @@ async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown"
                 )
     except (Forbidden, TelegramError) as e:
-        print(f"Telegram communication blocked/failed: {e}")
+        print(f"Telegram error: {e}")
     except Exception as e:
         try:
             await update.message.reply_text(f"❌ `SYSTEM ERROR`: {e}", parse_mode="Markdown")
@@ -377,7 +369,7 @@ def run_bot_async():
 
     TOKEN = os.getenv("BOT_TOKEN")
     if not TOKEN:
-        print("❌ BOT_TOKEN environment variable missing!")
+        print("❌ BOT_TOKEN missing!")
         return
 
     app = Application.builder().token(TOKEN).build()
@@ -412,15 +404,12 @@ def run_bot_async():
 
 # ============= Application Main =============
 if __name__ == "__main__":
-    # ১. টেলিগ্রাম বটের থ্রেড চালু করা
     bot_thread = threading.Thread(target=run_bot_async, daemon=True)
     bot_thread.start()
 
-    # ২. Self-Ping থ্রেড চালু করা (স্লিপ মোড বন্ধ রাখতে)
     ping_thread = threading.Thread(target=self_ping_loop, daemon=True)
     ping_thread.start()
 
-    # ৩. Flask ওয়েব সার্ভার চালু করা
     port = int(os.environ.get("PORT", 10000))
     print(f"🚀 Web Server Active on Port {port}...")
     flask_app.run(host="0.0.0.0", port=port)
