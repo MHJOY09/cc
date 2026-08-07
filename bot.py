@@ -19,7 +19,7 @@ from telegram.ext import (
     ConversationHandler,
     CallbackQueryHandler,
 )
-from telegram.error import TelegramError, Forbidden, BadRequest, RetryAfter
+from telegram.error import TelegramError, Forbidden, BadRequest
 
 # ============= Flask Web Server =============
 flask_app = Flask(__name__)
@@ -203,14 +203,14 @@ def process_files(file_paths, output_path, loop, progress_queue):
 
 # ============= Telegram Bot Handlers =============
 AWAITING_FILES = 1
-SESSION_TIMEOUT = 1200  # 20 minutes
+SESSION_TIMEOUT = 1800  # 30 minutes to be extra safe
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("🚀 Start Session", callback_data="start_merge")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     help_text = (
-        "⚡ **CYBER SCANNER ENGINE v3.8** ⚡\n"
+        "⚡ **CYBER SCANNER ENGINE v4.0** ⚡\n"
         "────────────────────────────\n"
         "🛡️ **Features:**\n"
         "• Luhn Algorithm – validates real card numbers\n"
@@ -219,16 +219,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Duplicate Removal – unique CC|MM|YY|CVV\n"
         "• Archive Support – .zip & .rar files\n"
         "• Inline Buttons – one‑tap control\n"
-        "• Auto Timeout (20 min) – auto cleanup\n"
-        "• Live Progress Bar – ASCII block progress\n"
-        "• Group Support – result sent privately\n"
-        "• **FloodWait Proof** – never stops downloading\n\n"
+        "• Smart Timeout (30 min) – only when truly idle\n"
+        "• Live ASCII Progress Bar\n"
+        "• **Flood-Proof Download** – no more stuck!\n"
+        "• Group Support – result sent privately\n\n"
         "📌 **Commands:**\n"
         "/merge – Start a new session\n"
         "/done – Process & get output\n"
         "/cancel – Abort session\n\n"
-        "💡 **Pro Tip:** For a clean chat, create a private group with just you and the bot, "
-        "send files there, and the result will be DM‑ed to you automatically.\n\n"
         "👇 Tap **Start Session** or type /merge"
     )
     try:
@@ -246,8 +244,9 @@ async def merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['output_file'] = str(temp_dir / "merged_output.txt")
     context.user_data['initiator'] = user_id
     context.user_data['last_activity'] = current_time()
-    context.user_data['last_status_update'] = 0
+    context.user_data['status_update_count'] = 0  # counter for batching
 
+    # Timeout checker will be started here but will respect active downloads
     if 'timeout_task' not in context.user_data or context.user_data['timeout_task'].done():
         timeout_task = asyncio.create_task(timeout_checker(update, context))
         context.user_data['timeout_task'] = timeout_task
@@ -265,7 +264,7 @@ async def merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📥 `STATUS`: Waiting for files...\n"
             "📦 `TOTAL FILES`: `0`\n"
             "📄 `LAST LOADED`: `None`\n"
-            "⏳ `TIMEOUT`: 20 min\n"
+            "⏳ `TIMEOUT`: 30 min (paused while downloading)\n"
             "────────────────────────\n"
             "⚡ Send `.txt`, `.zip`, or `.rar` files.\n"
             "Use buttons below to finish or cancel.",
@@ -279,9 +278,10 @@ async def merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return AWAITING_FILES
 
 async def timeout_checker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check every 30 seconds, but only timeout if no files received for SESSION_TIMEOUT."""
     try:
         while 'files' in context.user_data:
-            await asyncio.sleep(15)
+            await asyncio.sleep(30)
             if 'last_activity' not in context.user_data:
                 break
             if current_time() - context.user_data['last_activity'] > SESSION_TIMEOUT:
@@ -306,22 +306,6 @@ async def timeout_checker(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print(f"Timeout checker error: {e}")
 
-async def download_with_retry(file, file_path, max_retries=3):
-    for attempt in range(1, max_retries + 1):
-        try:
-            await file.download_to_drive(file_path)
-            return True
-        except RetryAfter as e:
-            wait = e.retry_after
-            print(f"FloodWait: retrying after {wait}s (attempt {attempt}/{max_retries})")
-            await asyncio.sleep(wait)
-        except Exception as e:
-            print(f"Download error (attempt {attempt}): {e}")
-            if attempt == max_retries:
-                return False
-            await asyncio.sleep(2)
-    return False
-
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'files' not in context.user_data or update.effective_user.id != context.user_data.get('initiator'):
         return AWAITING_FILES
@@ -333,23 +317,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if file_ext not in ['.txt', '.zip', '.rar']:
         return AWAITING_FILES
 
+    # Update activity BEFORE download to prevent timeout during download
     context.user_data['last_activity'] = current_time()
 
     try:
         file = await document.get_file()
         temp_dir = Path(context.user_data['temp_dir'])
         file_path = temp_dir / file_name
-        success = await download_with_retry(file, file_path)
-        if not success:
-            print(f"Failed to download {file_name} after retries")
-            return AWAITING_FILES
+        # Simple download with a small fixed delay to avoid flood
+        await file.download_to_drive(file_path)
+        await asyncio.sleep(1.5)  # Rate limit prevention (1.5 sec per file)
 
         context.user_data['files'].append(str(file_path))
         count = len(context.user_data['files'])
-        now = current_time()
-        last_update = context.user_data.get('last_status_update', 0)
-        if count % 10 == 0 or (now - last_update) >= 5:
-            context.user_data['last_status_update'] = now
+
+        # Update status only every 50 files to avoid edit flood
+        if count % 50 == 0 or count == 1:
             status_msg_id = context.user_data.get('status_msg_id')
             updated_text = (
                 "⚙️ **ANALYZING & BUFFERING DATA**...\n"
@@ -379,7 +362,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
 
     except Exception as e:
-        print(f"Unexpected error in handle_document: {e}")
+        print(f"Download error: {e}")
 
     return AWAITING_FILES
 
