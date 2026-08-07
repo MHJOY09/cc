@@ -7,6 +7,7 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
+from time import time as current_time
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -65,9 +66,8 @@ def luhn_check(cc_num: str) -> bool:
     total = sum(digits) + check_digit
     return total % 10 == 0
 
-# ============= Card Type Detection (Prefix-Based) =============
+# ============= Card Type Detection =============
 def get_card_type(cc: str) -> str:
-    """Return card brand based on first 1-6 digits (no API needed)."""
     if cc.startswith('4'):
         return 'Visa'
     if cc.startswith(('51','52','53','54','55')) or \
@@ -203,26 +203,34 @@ def process_files(file_paths, output_path, loop, progress_queue):
 
 # ============= Telegram Bot Handlers =============
 AWAITING_FILES = 1
-SESSION_TIMEOUT = 600  # 10 minutes
-
-async def safe_delete_message(message):
-    try:
-        await message.delete()
-    except (Forbidden, BadRequest, TelegramError):
-        pass
+SESSION_TIMEOUT = 1200  # 20 minutes
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send a detailed welcome/help message."""
     keyboard = [[InlineKeyboardButton("🚀 Start Session", callback_data="start_merge")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    msg = (
-        "⚡ **CYBER SCANNER ENGINE v3.4** ⚡\n"
-        "────────────────────────\n"
-        "SYSTEM: `ONLINE` 🟢\n"
-        "FILTER: `LUHN + CVV + CARD TYPE` 🛡️\n\n"
-        "👇 Tap below to begin or type /merge"
+
+    help_text = (
+        "⚡ **CYBER SCANNER ENGINE v3.6** ⚡\n"
+        "────────────────────────────\n"
+        "🛡️ **Features at a glance:**\n"
+        "• Luhn Algorithm – validates real card numbers\n"
+        "• CVV Detection – only cards with CVV\n"
+        "• Card Type Identifier – Visa, Mastercard, Amex, etc.\n"
+        "• Duplicate Removal – unique CC|MM|YY|CVV\n"
+        "• Archive Support – .zip & .rar files\n"
+        "• Inline Buttons – one‑tap control\n"
+        "• Auto Timeout (20 min) – auto cleanup\n"
+        "• Live Progress Bar – ASCII block progress\n"
+        "• Group Support – result sent privately\n\n"
+        "📌 **Commands:**\n"
+        "/merge – Start a new session\n"
+        "/done – Process & get output\n"
+        "/cancel – Abort session\n\n"
+        "👇 Tap **Start Session** or type /merge"
     )
     try:
-        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=reply_markup)
+        await update.message.reply_text(help_text, parse_mode="Markdown", reply_markup=reply_markup)
     except (Forbidden, TelegramError):
         pass
 
@@ -235,16 +243,13 @@ async def merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['files'] = []
     context.user_data['output_file'] = str(temp_dir / "merged_output.txt")
     context.user_data['initiator'] = user_id
+    context.user_data['last_activity'] = current_time()
 
-    # Cancel any existing timeout task
-    if 'timeout_task' in context.user_data:
-        context.user_data['timeout_task'].cancel()
+    # Start the lightweight timeout checker (single task, no repeated create/cancel)
+    if 'timeout_task' not in context.user_data or context.user_data['timeout_task'].done():
+        timeout_task = asyncio.create_task(timeout_checker(update, context))
+        context.user_data['timeout_task'] = timeout_task
 
-    # Start auto-timeout task
-    timeout_task = asyncio.create_task(auto_cancel_session(update, context))
-    context.user_data['timeout_task'] = timeout_task
-
-    # Inline buttons for Done/Cancel
     keyboard = [
         [InlineKeyboardButton("✅ Done", callback_data="done_merge"),
          InlineKeyboardButton("❌ Cancel", callback_data="cancel_merge")]
@@ -258,7 +263,7 @@ async def merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📥 `STATUS`: Waiting for files...\n"
             "📦 `TOTAL FILES`: `0`\n"
             "📄 `LAST LOADED`: `None`\n"
-            "⏳ `TIMEOUT`: 10 minutes\n"
+            "⏳ `TIMEOUT`: 20 min (resets on every file)\n"
             "────────────────────────\n"
             "⚡ Send `.txt`, `.zip`, or `.rar` files.\n"
             "Use buttons below to finish or cancel.",
@@ -271,36 +276,39 @@ async def merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return AWAITING_FILES
 
-async def auto_cancel_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Wait SESSION_TIMEOUT seconds, then cancel if session still active."""
-    await asyncio.sleep(SESSION_TIMEOUT)
-    if 'files' in context.user_data:
-        try:
-            status_msg_id = context.user_data.get('status_msg_id')
-            if status_msg_id:
-                try:
-                    await context.bot.delete_message(
-                        chat_id=update.effective_chat.id,
-                        message_id=status_msg_id
-                    )
-                except:
-                    pass
-            if 'temp_dir' in context.user_data:
-                shutil.rmtree(Path(context.user_data['temp_dir']), ignore_errors=True)
-            context.user_data.clear()
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="⏰ **Session timed out due to inactivity. Files cleared.**",
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            print(f"Auto-cancel error: {e}")
+async def timeout_checker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check every 15 seconds if session should timeout."""
+    try:
+        while 'files' in context.user_data:
+            await asyncio.sleep(15)
+            if 'last_activity' not in context.user_data:
+                break
+            if current_time() - context.user_data['last_activity'] > SESSION_TIMEOUT:
+                # Timeout reached, clean up
+                status_msg_id = context.user_data.get('status_msg_id')
+                if status_msg_id:
+                    try:
+                        await context.bot.delete_message(
+                            chat_id=update.effective_chat.id,
+                            message_id=status_msg_id
+                        )
+                    except:
+                        pass
+                if 'temp_dir' in context.user_data:
+                    shutil.rmtree(Path(context.user_data['temp_dir']), ignore_errors=True)
+                context.user_data.clear()
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="⏰ **Session timed out due to inactivity. Files cleared.**",
+                    parse_mode="Markdown"
+                )
+                break
+    except Exception as e:
+        print(f"Timeout checker error: {e}")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'files' not in context.user_data or update.effective_user.id != context.user_data.get('initiator'):
         return AWAITING_FILES
-
-    await safe_delete_message(update.message)
 
     document = update.message.document
     file_name = document.file_name
@@ -308,6 +316,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if file_ext not in ['.txt', '.zip', '.rar']:
         return AWAITING_FILES
+
+    # Update activity timestamp (timer reset without creating new task)
+    context.user_data['last_activity'] = current_time()
 
     try:
         file = await document.get_file()
@@ -361,12 +372,12 @@ async def progress_updater(queue, chat_id, message_id, context):
             break
         idx, total, fname = data
         percent = int((idx / total) * 100) if total > 0 else 100
-        filled = "🟩" * (percent // 10)
-        empty = "⬜" * (10 - (percent // 10))
-        bar = filled + empty
-        spinner = "🔄" if percent < 100 else "✅"
+        # ASCII block progress bar (works on all devices)
+        filled_blocks = "█" * (percent // 10)
+        empty_blocks = "░" * (10 - (percent // 10))
+        bar = filled_blocks + empty_blocks
         text = (
-            f"{spinner} **CYBER PARSER EXECUTING**\n"
+            "🔍 **CYBER PARSER EXECUTING**\n"
             "────────────────────────\n"
             f"⚙️ `STAGE`: Processing file {idx}/{total}...\n"
             f"📄 `CURRENT`: `{fname}`\n"
@@ -388,13 +399,15 @@ async def progress_updater(queue, chat_id, message_id, context):
         queue.task_done()
 
 async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Cancel timeout if running
+    # Cancel timeout task (stop the checker loop)
     if 'timeout_task' in context.user_data:
         context.user_data['timeout_task'].cancel()
 
-    # Delete the command message only if it was a text command (not a button press)
     if update.message:
-        await safe_delete_message(update.message)
+        try:
+            await update.message.delete()
+        except:
+            pass
 
     if 'files' not in context.user_data or not context.user_data['files']:
         try:
@@ -499,9 +512,11 @@ async def cancel_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'timeout_task' in context.user_data:
         context.user_data['timeout_task'].cancel()
 
-    # Delete command message only if it was a text command
     if update.message:
-        await safe_delete_message(update.message)
+        try:
+            await update.message.delete()
+        except:
+            pass
 
     status_msg_id = context.user_data.get('status_msg_id')
     if status_msg_id:
@@ -525,7 +540,7 @@ async def cancel_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return ConversationHandler.END
 
-# ============= Callback Query Handler for Inline Buttons =============
+# ============= Callback Query Handler =============
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
