@@ -5,7 +5,7 @@ import shutil
 import asyncio
 import threading
 import time
-import urllib.request  # Built-in module (requests এর দরকার নেই)
+import urllib.request
 from pathlib import Path
 from flask import Flask
 from telegram import Update
@@ -30,12 +30,11 @@ def home():
 def health():
     return "OK", 200
 
-# ============= Self-Ping System (Built-in urllib) =============
+# ============= Self-Ping System =============
 def self_ping_loop():
     time.sleep(10)
     port = os.environ.get("PORT", "10000")
     url = f"http://127.0.0.1:{port}/health"
-    
     while True:
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -43,16 +42,31 @@ def self_ping_loop():
                 pass
         except Exception:
             pass
-        time.sleep(600)  # প্রতি ১০ মিনিটে পিং
+        time.sleep(600)
 
-# ============= RAR File Support =============
+# ============= RAR Support =============
 try:
     import rarfile
     RAR_SUPPORT = True
 except ImportError:
     RAR_SUPPORT = False
 
-# ============= Core Processing Logics =============
+# ============= Luhn Validation =============
+def luhn_check(cc_num: str) -> bool:
+    """বাস্তব ব্যাংক কার্ডের গাণিতিক যাচাই (mod 10)."""
+    if not cc_num.isdigit():
+        return False
+    digits = [int(d) for d in cc_num]
+    check_digit = digits.pop()
+    digits.reverse()
+    for i in range(0, len(digits), 2):
+        digits[i] *= 2
+        if digits[i] > 9:
+            digits[i] -= 9
+    total = sum(digits) + check_digit
+    return total % 10 == 0
+
+# ============= Core Processing =============
 def extract_text_from_archive(archive_path):
     content = ""
     ext = os.path.splitext(archive_path)[1].lower()
@@ -90,26 +104,25 @@ def parse_line_to_cc_cvv(line):
     if not cc_match:
         return None
     cc = cc_match.group(1)
+    # Luhn check – বাতিল হলে এই লাইন বাদ
+    if not luhn_check(cc):
+        return None
 
     exp_match = re.search(r'\b(0[1-9]|1[0-2])[\s|/:\-,;]+(\d{4}|\d{2})\b', line)
     if not exp_match:
         return None
-        
     mm = f"{int(exp_match.group(1)):02d}"
     yy = exp_match.group(2)[-2:]
 
     temp_line = line.replace(cc, '').replace(exp_match.group(0), '')
     cvv_match = re.search(r'\b(\d{3,4})\b', temp_line)
-    
     if not cvv_match:
         return None
-        
     cvv = cvv_match.group(1)
     return (cc, mm, yy, cvv)
 
 def extract_cards_from_text(content):
     unique_cards = set()
-
     for line in content.splitlines():
         parsed = parse_line_to_cc_cvv(line)
         if parsed:
@@ -122,20 +135,24 @@ def extract_cards_from_text(content):
         r'(?:CVV|CVC)[:\s]*(\d{3,4})',
         re.IGNORECASE
     )
-    
     for match in block_pattern.finditer(content):
         cc = match.group(1)
+        if not luhn_check(cc):
+            continue
         mm = f"{int(match.group(2)):02d}"
         yy = match.group(3)[-2:]
         cvv = match.group(4)
         if cvv:
             unique_cards.add(f"{cc}|{mm}|{yy}|{cvv}")
-
     return unique_cards
 
-def process_files(file_paths, output_path):
+def process_files(file_paths, output_path, progress_queue=None):
+    """সমস্ত ফাইল প্রসেস করে, প্রগ্রেস কলব্যাক পাঠায় (যদি queue থাকে)."""
     all_unique_cards = set()
-    for path in file_paths:
+    total = len(file_paths)
+    loop = asyncio.get_event_loop() if progress_queue else None
+
+    for idx, path in enumerate(file_paths, 1):
         path = Path(path)
         if not path.exists():
             continue
@@ -155,6 +172,10 @@ def process_files(file_paths, output_path):
         extracted = extract_cards_from_text(content)
         all_unique_cards.update(extracted)
 
+        # প্রগ্রেস আপডেট (থ্রেড-সেফ)
+        if progress_queue is not None:
+            loop.call_soon_threadsafe(progress_queue.put_nowait, (idx, total, path.name))
+
     with open(output_path, 'w', encoding='utf-8') as f:
         for card in sorted(all_unique_cards):
             f.write(card + '\n')
@@ -172,10 +193,10 @@ async def safe_delete_message(message):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "⚡ **CYBER SCANNER ENGINE v3.1** ⚡\n"
+        "⚡ **CYBER SCANNER ENGINE v3.2** ⚡\n"
         "────────────────────────\n"
         "SYSTEM: `ONLINE` 🟢\n"
-        "FILTER: `ONLY VALID CVV CARDS` 🛡️\n\n"
+        "FILTER: `LUHN + CVV ONLY` 🛡️\n\n"
         "👉 Start Session: /merge\n"
         "👉 Abort Session: /cancel"
     )
@@ -186,12 +207,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    temp_dir = Path(f"temp/{user_id}")
+    chat_id = update.effective_chat.id
+    temp_dir = Path(f"temp/{user_id}_{chat_id}")
     temp_dir.mkdir(parents=True, exist_ok=True)
     context.user_data['temp_dir'] = str(temp_dir)
     context.user_data['files'] = []
     context.user_data['output_file'] = str(temp_dir / "merged_output.txt")
-    
+    context.user_data['initiator'] = user_id  # সেশন ওনার
+
     try:
         status_msg = await update.message.reply_text(
             "🧠 **CYBER ENGINE INITIALIZED**\n"
@@ -211,11 +234,8 @@ async def merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return AWAITING_FILES
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if 'files' not in context.user_data:
-        try:
-            await update.message.reply_text("⚠️ System inactive. Use `/merge` first.", parse_mode="Markdown")
-        except (Forbidden, TelegramError):
-            pass
+    # শুধুমাত্র সেশন ইন্সটিগেটরের ফাইল গ্রহণ
+    if 'files' not in context.user_data or update.effective_user.id != context.user_data.get('initiator'):
         return AWAITING_FILES
 
     await safe_delete_message(update.message)
@@ -233,10 +253,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_path = temp_dir / file_name
         await file.download_to_drive(file_path)
         context.user_data['files'].append(str(file_path))
-        
+
         count = len(context.user_data['files'])
         status_msg_id = context.user_data.get('status_msg_id')
-        
+
         updated_text = (
             "⚙️ **ANALYZING & BUFFERING DATA**...\n"
             "────────────────────────\n"
@@ -246,7 +266,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "────────────────────────\n"
             "⚡ Keep sending files or send `/done` to execute."
         )
-        
+
         if status_msg_id:
             try:
                 await context.bot.edit_message_text(
@@ -263,6 +283,38 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return AWAITING_FILES
 
+async def progress_updater(queue, chat_id, message_id, context, file_count):
+    """প্রগ্রেস বার আপডেট করার async টাস্ক."""
+    last_percent = -1
+    while True:
+        data = await queue.get()
+        if data is None:
+            break
+        idx, total, fname = data
+        percent = int((idx / total) * 100) if total > 0 else 100
+        bar = "▓" * (percent // 10) + "░" * (10 - percent // 10)
+        text = (
+            "🔍 **CYBER PARSER EXECUTING**\n"
+            "────────────────────────\n"
+            f"⚙️ `STAGE`: Processing file {idx}/{total}...\n"
+            f"📄 `CURRENT`: `{fname}`\n"
+            f"📊 `PROGRESS`: [{bar}] {percent}%\n"
+            "────────────────────────\n"
+            "⏳ Please wait..."
+        )
+        if percent != last_percent:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+            last_percent = percent
+        queue.task_done()
+
 async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_delete_message(update.message)
 
@@ -277,34 +329,28 @@ async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     output_path = context.user_data['output_file']
     temp_dir = Path(context.user_data['temp_dir'])
     status_msg_id = context.user_data.get('status_msg_id')
+    chat_id = update.effective_chat.id
+    initiator_id = context.user_data['initiator']
 
-    processing_text = (
-        "🔍 **CYBER PARSER EXECUTING**\n"
-        "────────────────────────\n"
-        "⚙️ `STAGE`: Filtering No-CVV & Duplicates...\n"
-        f"📦 `FILES IN QUEUE`: `{len(files)}`\n"
-        "⏳ `STATUS`: Running RegEx Engine...\n"
-        "────────────────────────\n"
-        "⏳ Please wait..."
+    # প্রগ্রেস বার সেটআপ
+    queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    updater_task = asyncio.ensure_future(
+        progress_updater(queue, chat_id, status_msg_id, context, len(files))
     )
-    if status_msg_id:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=update.effective_chat.id,
-                message_id=status_msg_id,
-                text=processing_text,
-                parse_mode="Markdown"
-            )
-        except (Forbidden, BadRequest, TelegramError):
-            pass
 
     try:
-        loop = asyncio.get_running_loop()
-        count = await loop.run_in_executor(None, process_files, files, output_path)
+        # ব্যাকগ্রাউন্ডে প্রসেসিং, queue-এর মাধ্যমে প্রগ্রেস পাঠানো
+        count = await loop.run_in_executor(None, process_files, files, output_path, queue)
 
+        # সেন্টিনেল পাঠিয়ে আপডেটার শেষ করা
+        await queue.put(None)
+        await updater_task
+
+        # প্রগ্রেস মেসেজ মুছে ফেলা (যদি থাকে)
         if status_msg_id:
             try:
-                await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=status_msg_id)
+                await context.bot.delete_message(chat_id=chat_id, message_id=status_msg_id)
             except (Forbidden, BadRequest, TelegramError):
                 pass
 
@@ -314,22 +360,42 @@ async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
             final_caption = (
                 "🎯 **EXTRACTION COMPLETE**\n"
                 "────────────────────────\n"
-                f"📊 `TOTAL CARDS (WITH CVV)`: `{count}`\n"
+                f"📊 `TOTAL CARDS (WITH CVV & LUHN)`: `{count}`\n"
                 f"📁 `PROCESSED FILES`: `{len(files)}`\n"
                 "🛡️ `FORMAT`: `CC|MM|YY|CVV`\n"
                 "────────────────────────\n"
                 "🔥 Session Closed Successfully."
             )
-            with open(output_path, 'rb') as f:
-                await context.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=f,
-                    filename="Merged_Cards_With_CVV.txt",
-                    caption=final_caption,
-                    parse_mode="Markdown"
-                )
-    except (Forbidden, TelegramError) as e:
-        print(f"Telegram error: {e}")
+
+            # গ্রুপ/সুপারগ্রুপ হলে প্রাইভেটে ফাইল পাঠানো, নয়তো সরাসরি
+            if update.effective_chat.type in ['group', 'supergroup']:
+                try:
+                    await context.bot.send_document(
+                        chat_id=initiator_id,
+                        document=open(output_path, 'rb'),
+                        filename="Merged_Cards_With_CVV.txt",
+                        caption=final_caption,
+                        parse_mode="Markdown"
+                    )
+                    await update.message.reply_text(
+                        "✅ **Processing complete.** I've sent you the result in private.",
+                        parse_mode="Markdown"
+                    )
+                except Forbidden:
+                    await update.message.reply_text(
+                        "⚠️ I cannot send you a private message. Please start a chat with me first: https://t.me/your_bot_username",
+                        parse_mode="Markdown"
+                    )
+            else:
+                with open(output_path, 'rb') as f:
+                    await context.bot.send_document(
+                        chat_id=chat_id,
+                        document=f,
+                        filename="Merged_Cards_With_CVV.txt",
+                        caption=final_caption,
+                        parse_mode="Markdown"
+                    )
+
     except Exception as e:
         try:
             await update.message.reply_text(f"❌ `SYSTEM ERROR`: {e}", parse_mode="Markdown")
@@ -353,7 +419,7 @@ async def cancel_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if 'temp_dir' in context.user_data:
         shutil.rmtree(Path(context.user_data['temp_dir']), ignore_errors=True)
-    
+
     context.user_data.clear()
     try:
         await update.message.reply_text("🚫 **SESSION ABORTED & BUFFER PURGED**", parse_mode="Markdown")
