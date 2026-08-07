@@ -330,9 +330,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['files'].append(str(file_path))
 
         count = len(context.user_data['files'])
-        # Batch status update: only update every 10 files or if 5 seconds have passed
         now = current_time()
         last_update = context.user_data.get('last_status_update', 0)
+        # Batch status update: only update every 10 files or if 5 seconds have passed
         if count % 10 == 0 or (now - last_update) >= 5:
             context.user_data['last_status_update'] = now
             status_msg_id = context.user_data.get('status_msg_id')
