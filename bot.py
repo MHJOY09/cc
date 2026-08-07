@@ -53,16 +53,15 @@ except ImportError:
 
 # ============= Luhn Validation =============
 def luhn_check(cc_num: str) -> bool:
-    """বাস্তব ব্যাংক কার্ডের গাণিতিক যাচাই (mod 10)."""
+    """Check credit card number using Luhn algorithm (mod 10)."""
     if not cc_num.isdigit():
         return False
     digits = [int(d) for d in cc_num]
     check_digit = digits.pop()
     digits.reverse()
     for i in range(0, len(digits), 2):
-        digits[i] *= 2
-        if digits[i] > 9:
-            digits[i] -= 9
+        doubled = digits[i] * 2
+        digits[i] = doubled - 9 if doubled > 9 else doubled
     total = sum(digits) + check_digit
     return total % 10 == 0
 
@@ -104,7 +103,6 @@ def parse_line_to_cc_cvv(line):
     if not cc_match:
         return None
     cc = cc_match.group(1)
-    # Luhn check – বাতিল হলে এই লাইন বাদ
     if not luhn_check(cc):
         return None
 
@@ -146,11 +144,10 @@ def extract_cards_from_text(content):
             unique_cards.add(f"{cc}|{mm}|{yy}|{cvv}")
     return unique_cards
 
-def process_files(file_paths, output_path, progress_queue=None):
-    """সমস্ত ফাইল প্রসেস করে, প্রগ্রেস কলব্যাক পাঠায় (যদি queue থাকে)."""
+def process_files(file_paths, output_path, loop, progress_queue):
+    """Process files in a background thread, sending progress via loop+queue."""
     all_unique_cards = set()
     total = len(file_paths)
-    loop = asyncio.get_event_loop() if progress_queue else None
 
     for idx, path in enumerate(file_paths, 1):
         path = Path(path)
@@ -172,9 +169,11 @@ def process_files(file_paths, output_path, progress_queue=None):
         extracted = extract_cards_from_text(content)
         all_unique_cards.update(extracted)
 
-        # প্রগ্রেস আপডেট (থ্রেড-সেফ)
-        if progress_queue is not None:
-            loop.call_soon_threadsafe(progress_queue.put_nowait, (idx, total, path.name))
+        # Thread-safe progress update
+        if loop and progress_queue:
+            loop.call_soon_threadsafe(
+                progress_queue.put_nowait, (idx, total, path.name)
+            )
 
     with open(output_path, 'w', encoding='utf-8') as f:
         for card in sorted(all_unique_cards):
@@ -213,7 +212,7 @@ async def merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['temp_dir'] = str(temp_dir)
     context.user_data['files'] = []
     context.user_data['output_file'] = str(temp_dir / "merged_output.txt")
-    context.user_data['initiator'] = user_id  # সেশন ওনার
+    context.user_data['initiator'] = user_id
 
     try:
         status_msg = await update.message.reply_text(
@@ -234,7 +233,6 @@ async def merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return AWAITING_FILES
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # শুধুমাত্র সেশন ইন্সটিগেটরের ফাইল গ্রহণ
     if 'files' not in context.user_data or update.effective_user.id != context.user_data.get('initiator'):
         return AWAITING_FILES
 
@@ -283,12 +281,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return AWAITING_FILES
 
-async def progress_updater(queue, chat_id, message_id, context, file_count):
-    """প্রগ্রেস বার আপডেট করার async টাস্ক."""
+async def progress_updater(queue, chat_id, message_id, context):
+    """Update the status message with a progress bar."""
     last_percent = -1
     while True:
         data = await queue.get()
-        if data is None:
+        if data is None:          # Sentinel to stop
+            queue.task_done()
             break
         idx, total, fname = data
         percent = int((idx / total) * 100) if total > 0 else 100
@@ -332,22 +331,23 @@ async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     initiator_id = context.user_data['initiator']
 
-    # প্রগ্রেস বার সেটআপ
+    # Setup progress queue and updater task
     queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
     updater_task = asyncio.ensure_future(
-        progress_updater(queue, chat_id, status_msg_id, context, len(files))
+        progress_updater(queue, chat_id, status_msg_id, context)
     )
 
     try:
-        # ব্যাকগ্রাউন্ডে প্রসেসিং, queue-এর মাধ্যমে প্রগ্রেস পাঠানো
-        count = await loop.run_in_executor(None, process_files, files, output_path, queue)
-
-        # সেন্টিনেল পাঠিয়ে আপডেটার শেষ করা
+        # Process files in background (pass loop + queue)
+        count = await loop.run_in_executor(
+            None, process_files, files, output_path, loop, queue
+        )
+        # Send sentinel to stop updater
         await queue.put(None)
         await updater_task
 
-        # প্রগ্রেস মেসেজ মুছে ফেলা (যদি থাকে)
+        # Delete status message
         if status_msg_id:
             try:
                 await context.bot.delete_message(chat_id=chat_id, message_id=status_msg_id)
@@ -367,7 +367,7 @@ async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🔥 Session Closed Successfully."
             )
 
-            # গ্রুপ/সুপারগ্রুপ হলে প্রাইভেটে ফাইল পাঠানো, নয়তো সরাসরি
+            # Handle group chat → send result privately
             if update.effective_chat.type in ['group', 'supergroup']:
                 try:
                     await context.bot.send_document(
@@ -383,10 +383,11 @@ async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 except Forbidden:
                     await update.message.reply_text(
-                        "⚠️ I cannot send you a private message. Please start a chat with me first: https://t.me/your_bot_username",
+                        "⚠️ I cannot send you a private message. Please start a chat with me first: https://t.me/YOUR_BOT_USERNAME",
                         parse_mode="Markdown"
                     )
             else:
+                # Private chat → send directly
                 with open(output_path, 'rb') as f:
                     await context.bot.send_document(
                         chat_id=chat_id,
