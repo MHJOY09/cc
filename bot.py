@@ -206,17 +206,17 @@ AWAITING_FILES = 1
 SESSION_TIMEOUT = 1200  # 20 minutes
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send a detailed welcome/help message."""
+    """Send detailed help with features and usage tips."""
     keyboard = [[InlineKeyboardButton("🚀 Start Session", callback_data="start_merge")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     help_text = (
-        "⚡ **CYBER SCANNER ENGINE v3.6** ⚡\n"
+        "⚡ **CYBER SCANNER ENGINE v3.7** ⚡\n"
         "────────────────────────────\n"
-        "🛡️ **Features at a glance:**\n"
+        "🛡️ **Features:**\n"
         "• Luhn Algorithm – validates real card numbers\n"
         "• CVV Detection – only cards with CVV\n"
-        "• Card Type Identifier – Visa, Mastercard, Amex, etc.\n"
+        "• Card Type Identifier – Visa, MC, Amex, etc.\n"
         "• Duplicate Removal – unique CC|MM|YY|CVV\n"
         "• Archive Support – .zip & .rar files\n"
         "• Inline Buttons – one‑tap control\n"
@@ -227,6 +227,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/merge – Start a new session\n"
         "/done – Process & get output\n"
         "/cancel – Abort session\n\n"
+        "💡 **Pro Tip:** For a clean chat, create a private group with just you and the bot, "
+        "send files there, and the result will be DM‑ed to you automatically.\n\n"
         "👇 Tap **Start Session** or type /merge"
     )
     try:
@@ -244,8 +246,9 @@ async def merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['output_file'] = str(temp_dir / "merged_output.txt")
     context.user_data['initiator'] = user_id
     context.user_data['last_activity'] = current_time()
+    context.user_data['last_status_update'] = 0   # for batch status updates
 
-    # Start the lightweight timeout checker (single task, no repeated create/cancel)
+    # Start the lightweight timeout checker (single task)
     if 'timeout_task' not in context.user_data or context.user_data['timeout_task'].done():
         timeout_task = asyncio.create_task(timeout_checker(update, context))
         context.user_data['timeout_task'] = timeout_task
@@ -263,7 +266,7 @@ async def merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📥 `STATUS`: Waiting for files...\n"
             "📦 `TOTAL FILES`: `0`\n"
             "📄 `LAST LOADED`: `None`\n"
-            "⏳ `TIMEOUT`: 20 min (resets on every file)\n"
+            "⏳ `TIMEOUT`: 20 min\n"
             "────────────────────────\n"
             "⚡ Send `.txt`, `.zip`, or `.rar` files.\n"
             "Use buttons below to finish or cancel.",
@@ -284,7 +287,6 @@ async def timeout_checker(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if 'last_activity' not in context.user_data:
                 break
             if current_time() - context.user_data['last_activity'] > SESSION_TIMEOUT:
-                # Timeout reached, clean up
                 status_msg_id = context.user_data.get('status_msg_id')
                 if status_msg_id:
                     try:
@@ -317,7 +319,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if file_ext not in ['.txt', '.zip', '.rar']:
         return AWAITING_FILES
 
-    # Update activity timestamp (timer reset without creating new task)
+    # Update activity timestamp (resets timeout)
     context.user_data['last_activity'] = current_time()
 
     try:
@@ -328,35 +330,38 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['files'].append(str(file_path))
 
         count = len(context.user_data['files'])
-        status_msg_id = context.user_data.get('status_msg_id')
+        # Batch status update: only update every 10 files or if 5 seconds have passed
+        now = current_time()
+        last_update = context.user_data.get('last_status_update', 0)
+        if count % 10 == 0 or (now - last_update) >= 5:
+            context.user_data['last_status_update'] = now
+            status_msg_id = context.user_data.get('status_msg_id')
+            updated_text = (
+                "⚙️ **ANALYZING & BUFFERING DATA**...\n"
+                "────────────────────────\n"
+                "📥 `STATUS`: Ingesting Logs...\n"
+                f"📦 `TOTAL FILES`: `{count}`\n"
+                f"📄 `LAST LOADED`: `{file_name}`\n"
+                "────────────────────────\n"
+                "⚡ Keep sending files or use buttons below."
+            )
+            keyboard = [
+                [InlineKeyboardButton("✅ Done", callback_data="done_merge"),
+                 InlineKeyboardButton("❌ Cancel", callback_data="cancel_merge")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
 
-        updated_text = (
-            "⚙️ **ANALYZING & BUFFERING DATA**...\n"
-            "────────────────────────\n"
-            "📥 `STATUS`: Ingesting Logs...\n"
-            f"📦 `TOTAL FILES`: `{count}`\n"
-            f"📄 `LAST LOADED`: `{file_name}`\n"
-            "────────────────────────\n"
-            "⚡ Keep sending files or use buttons below."
-        )
-
-        keyboard = [
-            [InlineKeyboardButton("✅ Done", callback_data="done_merge"),
-             InlineKeyboardButton("❌ Cancel", callback_data="cancel_merge")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        if status_msg_id:
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=update.effective_chat.id,
-                    message_id=status_msg_id,
-                    text=updated_text,
-                    parse_mode="Markdown",
-                    reply_markup=reply_markup
-                )
-            except (Forbidden, BadRequest, TelegramError):
-                pass
+            if status_msg_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=update.effective_chat.id,
+                        message_id=status_msg_id,
+                        text=updated_text,
+                        parse_mode="Markdown",
+                        reply_markup=reply_markup
+                    )
+                except (Forbidden, BadRequest, TelegramError):
+                    pass
 
     except Exception as e:
         print(f"Download error: {e}")
@@ -399,7 +404,7 @@ async def progress_updater(queue, chat_id, message_id, context):
         queue.task_done()
 
 async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Cancel timeout task (stop the checker loop)
+    # Cancel timeout checker
     if 'timeout_task' in context.user_data:
         context.user_data['timeout_task'].cancel()
 
