@@ -1,3 +1,4 @@
-python-telegram-bot>=20.0
-flask
-rarfile
+Flask==3.0.3
+gunicorn==23.0.0
+python-telegram-bot==21.0
+rarfile==0.10
