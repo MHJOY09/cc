@@ -203,14 +203,14 @@ def process_files(file_paths, output_path, loop, progress_queue):
 
 # ============= Telegram Bot Handlers =============
 AWAITING_FILES = 1
-SESSION_TIMEOUT = 1800  # 30 minutes to be extra safe
+SESSION_TIMEOUT = 1800  # 30 minutes
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("🚀 Start Session", callback_data="start_merge")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     help_text = (
-        "⚡ **CYBER SCANNER ENGINE v4.0** ⚡\n"
+        "⚡ **CYBER SCANNER ENGINE v5.0 (OPTIMIZED)** ⚡\n"
         "────────────────────────────\n"
         "🛡️ **Features:**\n"
         "• Luhn Algorithm – validates real card numbers\n"
@@ -219,9 +219,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Duplicate Removal – unique CC|MM|YY|CVV\n"
         "• Archive Support – .zip & .rar files\n"
         "• Inline Buttons – one‑tap control\n"
-        "• Smart Timeout (30 min) – only when truly idle\n"
+        "• Smart Timeout (30 min)\n"
         "• Live ASCII Progress Bar\n"
-        "• **Flood-Proof Download** – no more stuck!\n"
+        "• **FAST MODE** – 0.5s delay (1000+ files)\n"
         "• Group Support – result sent privately\n\n"
         "📌 **Commands:**\n"
         "/merge – Start a new session\n"
@@ -244,9 +244,9 @@ async def merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['output_file'] = str(temp_dir / "merged_output.txt")
     context.user_data['initiator'] = user_id
     context.user_data['last_activity'] = current_time()
-    context.user_data['status_update_count'] = 0  # counter for batching
+    context.user_data['status_update_count'] = 0
+    context.user_data['last_progress_percent'] = -1
 
-    # Timeout checker will be started here but will respect active downloads
     if 'timeout_task' not in context.user_data or context.user_data['timeout_task'].done():
         timeout_task = asyncio.create_task(timeout_checker(update, context))
         context.user_data['timeout_task'] = timeout_task
@@ -259,14 +259,14 @@ async def merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         status_msg = await update.effective_message.reply_text(
-            "🧠 **CYBER ENGINE INITIALIZED**\n"
+            "🧠 **CYBER ENGINE v5.0 INITIALIZED**\n"
             "────────────────────────\n"
             "📥 `STATUS`: Waiting for files...\n"
             "📦 `TOTAL FILES`: `0`\n"
             "📄 `LAST LOADED`: `None`\n"
             "⏳ `TIMEOUT`: 30 min (paused while downloading)\n"
             "────────────────────────\n"
-            "⚡ Send `.txt`, `.zip`, or `.rar` files.\n"
+            "⚡ Send `.txt`, `.zip`, or `.rar` files (1000+ supported).\n"
             "Use buttons below to finish or cancel.",
             parse_mode="Markdown",
             reply_markup=reply_markup
@@ -278,7 +278,6 @@ async def merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return AWAITING_FILES
 
 async def timeout_checker(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check every 30 seconds, but only timeout if no files received for SESSION_TIMEOUT."""
     try:
         while 'files' in context.user_data:
             await asyncio.sleep(30)
@@ -317,22 +316,23 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if file_ext not in ['.txt', '.zip', '.rar']:
         return AWAITING_FILES
 
-    # Update activity BEFORE download to prevent timeout during download
+    # Update activity BEFORE download
     context.user_data['last_activity'] = current_time()
 
     try:
         file = await document.get_file()
         temp_dir = Path(context.user_data['temp_dir'])
         file_path = temp_dir / file_name
-        # Simple download with a small fixed delay to avoid flood
+        
+        # OPTIMIZED: 0.5s delay instead of 1.5s
         await file.download_to_drive(file_path)
-        await asyncio.sleep(1.5)  # Rate limit prevention (1.5 sec per file)
+        await asyncio.sleep(0.5)
 
         context.user_data['files'].append(str(file_path))
         count = len(context.user_data['files'])
 
-        # Update status only every 50 files to avoid edit flood
-        if count % 50 == 0 or count == 1:
+        # Update status every 50 files OR at 100, 200, 500, 1000+ milestones
+        if count % 50 == 0 or count in [100, 200, 500, 1000, 1500, 2000]:
             status_msg_id = context.user_data.get('status_msg_id')
             updated_text = (
                 "⚙️ **ANALYZING & BUFFERING DATA**...\n"
@@ -375,19 +375,21 @@ async def progress_updater(queue, chat_id, message_id, context):
             break
         idx, total, fname = data
         percent = int((idx / total) * 100) if total > 0 else 100
-        filled_blocks = "█" * (percent // 10)
-        empty_blocks = "░" * (10 - (percent // 10))
-        bar = filled_blocks + empty_blocks
-        text = (
-            "🔍 **CYBER PARSER EXECUTING**\n"
-            "────────────────────────\n"
-            f"⚙️ `STAGE`: Processing file {idx}/{total}...\n"
-            f"📄 `CURRENT`: `{fname}`\n"
-            f"📊 `PROGRESS`: {bar} {percent}%\n"
-            "────────────────────────\n"
-            "⏳ Please wait..."
-        )
-        if percent != last_percent:
+        
+        # OPTIMIZED: Update every 5% instead of 10%
+        if percent - last_percent >= 5:
+            filled_blocks = "█" * (percent // 10)
+            empty_blocks = "░" * (10 - (percent // 10))
+            bar = filled_blocks + empty_blocks
+            text = (
+                "🔍 **CYBER PARSER EXECUTING**\n"
+                "────────────────────────\n"
+                f"⚙️ `STAGE`: Processing file {idx}/{total}...\n"
+                f"📄 `CURRENT`: `{fname}`\n"
+                f"📊 `PROGRESS`: {bar} {percent}%\n"
+                "────────────────────────\n"
+                "⏳ Please wait..."
+            )
             try:
                 await context.bot.edit_message_text(
                     chat_id=chat_id,
@@ -427,6 +429,19 @@ async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg_id = context.user_data.get('status_msg_id')
     chat_id = update.effective_chat.id
     initiator_id = context.user_data['initiator']
+    file_count = len(files)
+
+    # Show warning for 1000+ files
+    if file_count >= 1000:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ **LARGE DATASET DETECTED**: `{file_count}` files\n"
+                     "⏳ Processing may take 2-5 minutes. Please wait...",
+                parse_mode="Markdown"
+            )
+        except:
+            pass
 
     queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
@@ -458,7 +473,7 @@ async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🎯 **EXTRACTION COMPLETE**\n"
                 "────────────────────────\n"
                 f"📊 `TOTAL CARDS (WITH CVV & LUHN)`: `{count}`\n"
-                f"📁 `PROCESSED FILES`: `{len(files)}`\n"
+                f"📁 `PROCESSED FILES`: `{file_count}`\n"
                 "🛡️ `FORMAT`: `CC|MM|YY|CVV|Type`\n"
                 "────────────────────────\n"
                 "🔥 Session Closed Successfully."
@@ -481,7 +496,7 @@ async def done_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Forbidden:
                     await context.bot.send_message(
                         chat_id=chat_id,
-                        text="⚠️ I cannot send you a private message. Please start a chat with me first: https://t.me/CC_Marger_bot",
+                        text="⚠️ I cannot send you a private message. Please start a chat with me first.",
                         parse_mode="Markdown"
                     )
             else:
@@ -587,7 +602,7 @@ def run_bot_async():
     app.add_handler(conv_handler)
 
     async def main():
-        print("🤖 Initializing Cyber Bot Engine...")
+        print("🤖 Initializing Cyber Bot Engine v5.0...")
         await app.initialize()
         await app.start()
         print("🤖 Polling Loop Active...")
